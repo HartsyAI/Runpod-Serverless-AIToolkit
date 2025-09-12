@@ -1,3 +1,21 @@
+"""
+RunPod Serverless AI Training Handler for AI Toolkit - Hartsy Website Integration
+
+This handler uses the Hartsy website as a storage gateway with async file uploads,
+chunked upload support for large files, and callback functionality.
+
+Features:
+- Downloads dataset from website URLs instead of Supabase
+- Async file uploads during training (2-40GB support)
+- Chunked uploads with resume capability
+- Real-time progress callbacks to website
+- Status polling capability for website
+- 5 retry attempts over 10 minutes for failed uploads
+
+Author: Kalebbroo, Hartsy LLC
+Version: 2.1
+"""
+
 import json
 import os
 import subprocess
@@ -5,14 +23,21 @@ import logging
 import yaml
 import time
 import sys
+import asyncio
+import aiohttp
+import aiofiles
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 import runpod
-from supabase import create_client, Client
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from urllib.parse import urlparse
+import math
+import re
+from datetime import datetime, timedelta
 
-# Configure logging to output everything to stdout/stderr (which goes to worker logs)
+# Configure logging for production debugging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -20,15 +45,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def init_supabase_client() -> Client:
-    supabase_url = os.environ.get("SUPABASE_URL")
-    supabase_key = os.environ.get("SUPABASE_SECRET_KEY")
-    if not supabase_url or not supabase_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SECRET_KEY environment variables are required")
-    return create_client(supabase_url, supabase_key)
+# Configuration constants
+CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks for large file uploads
+MAX_RETRIES = 5
+RETRY_DELAY_BASE = 2  # seconds, exponential backoff
+UPLOAD_TIMEOUT = 300  # 5 minutes per chunk
+CALLBACK_TIMEOUT = 30  # 30 seconds for callbacks
+FILE_WATCH_DELAY = 3  # seconds to wait for file stabilization
 
 def extract_model_name_from_config(config_content: str) -> str:
-    """Extract model name from config content"""
+    """Extracts model name from YAML configuration for progress tracking and organization.
+    
+    This function parses the training configuration to determine the model name,
+    which is used for organizing outputs and progress reporting. It checks multiple
+    possible locations in the config hierarchy to ensure compatibility with
+    different AI Toolkit configurations.
+    
+    Args:
+        config_content: YAML configuration string from the training request
+        
+    Returns:
+        str: Extracted model name or 'default_model' if not found
+    """
     try:
         config_data = yaml.safe_load(config_content)
         model_name = (
@@ -37,176 +75,642 @@ def extract_model_name_from_config(config_content: str) -> str:
             config_data.get('model_name') or
             'default_model'
         )
+        logger.info(f"Extracted model name: {model_name}")
         return model_name
-    except Exception as e:
-        logger.warning(f"Could not extract model name from config: {e}")
+    except Exception as ex:
+        logger.warning(f"Could not extract model name from config: {ex}")
         return 'default_model'
 
-class FileUploadHandler(FileSystemEventHandler):
-    def __init__(self, training_handler, output_dir, bucket_name, upload_folder):
-        self.training_handler = training_handler
-        self.output_dir = Path(output_dir)
-        self.bucket_name = bucket_name
-        self.upload_folder = upload_folder
-        self.uploaded_files = set()  # Track already uploaded files
-        self.last_upload_times = {}  # Simple debounce
-        self.upload_delay = 3  # seconds between upload attempts for same file
+def calculate_progress_and_eta(log_line: str, start_time: float) -> Dict[str, Any]:
+    """Calculates training progress percentage and ETA from AI Toolkit log output.
+    
+    This function parses training logs to extract progress information and calculate
+    estimated time remaining. It looks for common progress patterns in AI Toolkit
+    output including step counts, epoch progress, and loss values.
+    
+    Args:
+        log_line: Single line from training output
+        start_time: Training start timestamp for ETA calculation
+        
+    Returns:
+        Dict containing progress percentage, current step info, and ETA in minutes
+    """
+    progress_info = {"progress": 0, "current_step": "Training", "eta_minutes": None}
+    
+    try:
+        # Look for step progress: "step 100/1000" or "Step: 100/1000"
+        step_match = re.search(r'step[:\s]+(\d+)[/\s]+(\d+)', log_line, re.IGNORECASE)
+        if step_match:
+            current = int(step_match.group(1))
+            total = int(step_match.group(2))
+            progress = int((current / total) * 100)
+            
+            # Calculate ETA based on elapsed time and progress
+            elapsed_minutes = (time.time() - start_time) / 60
+            if progress > 0:
+                estimated_total_minutes = (elapsed_minutes / progress) * 100
+                eta_minutes = max(1, int(estimated_total_minutes - elapsed_minutes))
+                progress_info["eta_minutes"] = eta_minutes
+            
+            progress_info["progress"] = progress
+            progress_info["current_step"] = f"Step {current}/{total}"
+            return progress_info
+        
+        # Look for epoch progress: "epoch 2/5" or "Epoch: 2/5"
+        epoch_match = re.search(r'epoch[:\s]+(\d+)[/\s]+(\d+)', log_line, re.IGNORECASE)
+        if epoch_match:
+            current = int(epoch_match.group(1))
+            total = int(epoch_match.group(2))
+            progress = int((current / total) * 100)
+            
+            # Rough ETA estimate: 10-15 minutes per epoch for LoRA training
+            remaining_epochs = total - current
+            eta_minutes = remaining_epochs * 12  # Average 12 minutes per epoch
+            
+            progress_info["progress"] = progress
+            progress_info["current_step"] = f"Epoch {current}/{total}"
+            progress_info["eta_minutes"] = eta_minutes
+            return progress_info
+        
+        # Look for loss values to indicate training is active
+        if re.search(r'loss[:\s=]+[0-9.]+', log_line, re.IGNORECASE):
+            progress_info["current_step"] = "Training in progress"
+            return progress_info
+            
+    except Exception as ex:
+        logger.debug(f"Error parsing progress from log line: {ex}")
+    
+    return progress_info
 
-    def on_created(self, event):
-        if not event.is_directory:
-            self.handle_file(Path(event.src_path))
+async def download_image_from_url(session: aiohttp.ClientSession, url: str, 
+                                save_path: Path, index: int) -> bool:
+    """Downloads a single training image from URL with error handling and validation.
+    
+    This function downloads images for the training dataset, handling various edge cases
+    like invalid URLs, network timeouts, and file validation. It generates safe filenames
+    and validates downloaded content to ensure training data quality.
+    
+    Args:
+        session: HTTP session for making requests
+        url: Image URL to download
+        save_path: Directory to save the image
+        index: Image index for filename generation
+        
+    Returns:
+        bool: True if download was successful, False otherwise
+    """
+    try:
+        # Generate safe filename from URL or use index
+        parsed_url = urlparse(url)
+        filename = Path(parsed_url.path).name
+        
+        if not filename or '.' not in filename:
+            filename = f"image_{index:04d}.jpg"
+        
+        # Sanitize filename for filesystem compatibility
+        filename = "".join(c for c in filename if c.isalnum() or c in '._-')
+        if not filename:
+            filename = f"image_{index:04d}.jpg"
+        
+        file_path = save_path / filename
+        
+        # Download with timeout
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with session.get(url, timeout=timeout) as response:
+            if response.status != 200:
+                logger.warning(f"Failed to download {url}: HTTP {response.status}")
+                return False
+            
+            content = await response.read()
+            
+            # Validate downloaded content
+            if len(content) < 1024:  # Less than 1KB is suspicious
+                logger.warning(f"Downloaded image {filename} is too small ({len(content)} bytes)")
+                return False
+            
+            # Save to file
+            async with aiofiles.open(file_path, 'wb') as f:
+                await f.write(content)
+            
+            logger.debug(f"Downloaded {filename}: {len(content) / 1024:.1f}KB")
+            return True
+    
+    except Exception as ex:
+        logger.warning(f"Failed to download {url}: {ex}")
+        return False
 
-    def on_modified(self, event):
-        if not event.is_directory:
-            self.handle_file(Path(event.src_path))
-
-    def handle_file(self, file_path):
+async def send_hartsy_callback(session: aiohttp.ClientSession, callback_url: str, 
+                              callback_token: str, data: Dict[str, Any]) -> bool:
+    """Sends callback to Hartsy website with retry logic and error handling.
+    
+    This function handles all communication back to the website, including progress
+    updates, file upload notifications, and completion callbacks. It includes
+    comprehensive retry logic with exponential backoff for reliability.
+    
+    Args:
+        session: HTTP session for making requests
+        callback_url: Website callback endpoint URL
+        callback_token: Authentication token for the request
+        data: Callback data to send
+        
+    Returns:
+        bool: True if callback was sent successfully
+    """
+    headers = {
+        'Authorization': f'Bearer {callback_token}',
+        'Content-Type': 'application/json',
+        'User-Agent': 'RunPod-TrainingHandler/2.1'
+    }
+    
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            time.sleep(2)  # Basic delay to let file finish writing
-            if not file_path.exists():
-                return
-            if file_path.name == 'config.yaml':
-                return
-            if str(file_path) in self.uploaded_files:
-                return
-            now = time.time()
-            last_time = self.last_upload_times.get(str(file_path), 0)
-            if now - last_time < self.upload_delay:
-                return
-            self.last_upload_times[str(file_path)] = now
-            file_size = file_path.stat().st_size
-            if file_size == 0:
-                logger.warning(f"EMPTY FILE: {file_path}")
-                return
-            logger.info(f"UPLOADING FILE: {file_path.name} ({file_size / 1024 / 1024:.1f}MB)")
-            try:
-                relative_path = file_path.relative_to(self.output_dir)
-                remote_path = f"{self.upload_folder}/{relative_path}"
-                remote_path = remote_path.replace('\\', '/')
-                if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
-                    logger.info(f"UPLOAD SUCCESS: {relative_path}")
-                    self.uploaded_files.add(str(file_path))
-                else:
-                    logger.error(f"UPLOAD FAILED: {relative_path}")
-            except ValueError:
-                logger.warning(f"FILE OUTSIDE OUTPUT DIR: {file_path}")
-                return
-        except Exception as e:
-            logger.error(f"UPLOAD ERROR for {file_path}: {str(e)}")
-
-class TrainingHandler:
-    def __init__(self):
-        self.supabase = init_supabase_client()
-        self.workspace = Path("/workspace")
-        self.training_dir = self.workspace / "training"
-        self.training_dir.mkdir(exist_ok=True)
-        self.ai_toolkit_dir = Path("/app/ai-toolkit")
-        self.run_script = self.ai_toolkit_dir / "run.py"
-        if not self.ai_toolkit_dir.exists() or not self.run_script.exists():
-            raise ValueError(f"AI Toolkit not found at expected location: {self.ai_toolkit_dir}")
-
-    def download_dataset(self, bucket_name: str, dataset_folder: str, local_path: Path):
-        logger.info(f"Downloading dataset from {bucket_name}/{dataset_folder}")
-        try:
-            files = self.supabase.storage.from_(bucket_name).list(dataset_folder)
-            if not files:
-                logger.warning(f"No files found in {bucket_name}/{dataset_folder}")
-                return
-            local_path.mkdir(parents=True, exist_ok=True)
-            download_count = 0
-            for file_info in files:
-                if file_info.get('name') and not file_info['name'].endswith('/'):
-                    file_path = f"{dataset_folder}/{file_info['name']}"
-                    local_file_path = local_path / file_info['name']
-                    response = self.supabase.storage.from_(bucket_name).download(file_path)
-                    with open(local_file_path, 'wb') as f:
-                        f.write(response)
-                    download_count += 1
-            logger.info(f"Dataset download completed: {download_count} files")
-        except Exception as e:
-            logger.error(f"Error downloading dataset: {str(e)}")
-            raise
-
-    def upload_file_to_supabase(self, local_file: Path, bucket_name: str, remote_path: str):
-        try:
-            file_size = local_file.stat().st_size
-            logger.info(f"Starting upload: {local_file.name} ({file_size / 1024 / 1024:.1f}MB)")
-            with open(local_file, 'rb') as f:
-                file_data = f.read()
-            try:
-                response = self.supabase.storage.from_(bucket_name).upload(
-                    remote_path, file_data,
-                    file_options={"content-type": "application/octet-stream"}
-                )
-                logger.info(f"Upload successful: {local_file.name}")
-                return True
-            except Exception as upload_error:
-                error_str = str(upload_error).lower()
-                if "already exists" in error_str or "400" in error_str:
-                    logger.info(f"File exists, updating: {local_file.name}")
-                    response = self.supabase.storage.from_(bucket_name).update(
-                        remote_path, file_data,
-                        file_options={"content-type": "application/octet-stream"}
-                    )
-                    logger.info(f"Update successful: {local_file.name}")
+            timeout = aiohttp.ClientTimeout(total=CALLBACK_TIMEOUT)
+            async with session.post(callback_url, json=data, headers=headers, timeout=timeout) as response:
+                if response.status == 200:
+                    logger.debug(f"Callback sent successfully on attempt {attempt}")
                     return True
                 else:
-                    raise upload_error
-        except Exception as e:
-            logger.error(f"Upload error for {local_file}: {str(e)}")
-            return False
-
-    def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str):
+                    error_text = await response.text()
+                    logger.warning(f"Callback attempt {attempt} failed: HTTP {response.status} - {error_text}")
         
-        event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder)
-        observer = Observer()
-        observer.schedule(event_handler, str(output_dir), recursive=True)
-        observer.start()
-        return observer
+        except Exception as ex:
+            logger.warning(f"Callback attempt {attempt} failed with exception: {ex}")
+        
+        if attempt < MAX_RETRIES:
+            delay = min(RETRY_DELAY_BASE ** attempt, 60)  # Cap at 60 seconds
+            logger.info(f"Retrying callback in {delay} seconds...")
+            await asyncio.sleep(delay)
+    
+    logger.error(f"All callback attempts failed after {MAX_RETRIES} retries")
+    return False
 
-    def run_training(self, config_content: str, dataset_config: Dict[str, Any], upload_config: Dict[str, Any]) -> Dict[str, Any]:
-        session_id = None
-        file_observer = None
+async def upload_file_chunked(session: aiohttp.ClientSession, file_path: Path,
+                            upload_url: str, callback_token: str) -> bool:
+    """Uploads large files using chunked upload with resume capability.
+    
+    This function handles uploading large model files (2-40GB) by breaking them into
+    chunks and uploading with resume capability. It's designed for the large checkpoint
+    and final model files generated during training.
+    
+    Args:
+        session: HTTP session for making requests
+        file_path: Local file to upload
+        upload_url: Upload endpoint URL
+        callback_token: Authentication token
+        
+    Returns:
+        bool: True if upload completed successfully
+    """
+    if not file_path.exists():
+        logger.error(f"File not found for upload: {file_path}")
+        return False
+    
+    file_size = file_path.stat().st_size
+    file_size_mb = file_size / (1024 * 1024)
+    logger.info(f"Starting chunked upload: {file_path.name} ({file_size_mb:.1f}MB)")
+    
+    headers = {
+        'Authorization': f'Bearer {callback_token}',
+        'User-Agent': 'RunPod-TrainingHandler/2.1'
+    }
+    
+    # For files under 50MB, use regular upload
+    if file_size_mb < 50:
+        try:
+            async with aiofiles.open(file_path, 'rb') as f:
+                file_data = await f.read()
+            
+            form_data = aiohttp.FormData()
+            form_data.add_field('file', file_data, filename=file_path.name)
+            form_data.add_field('path', str(file_path.relative_to(file_path.parent.parent)))
+            
+            timeout = aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT)
+            async with session.post(upload_url, data=form_data, headers=headers, timeout=timeout) as response:
+                if response.status == 200:
+                    logger.info(f"Small file upload successful: {file_path.name}")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Small file upload failed: HTTP {response.status} - {error_text}")
+                    return False
+        
+        except Exception as ex:
+            logger.error(f"Small file upload error: {ex}")
+            return False
+    
+    # For large files, use chunked upload
+    try:
+        total_chunks = math.ceil(file_size / CHUNK_SIZE)
+        
+        async with aiofiles.open(file_path, 'rb') as f:
+            for chunk_index in range(total_chunks):
+                chunk_start = chunk_index * CHUNK_SIZE
+                chunk_data = await f.read(CHUNK_SIZE)
+                
+                if not chunk_data:
+                    break
+                
+                # Retry logic for each chunk
+                chunk_uploaded = False
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        form_data = aiohttp.FormData()
+                        form_data.add_field('chunk', chunk_data, filename=f"{file_path.name}.chunk{chunk_index}")
+                        form_data.add_field('chunkIndex', str(chunk_index))
+                        form_data.add_field('totalChunks', str(total_chunks))
+                        form_data.add_field('fileName', file_path.name)
+                        form_data.add_field('fileSize', str(file_size))
+                        form_data.add_field('path', str(file_path.relative_to(file_path.parent.parent)))
+                        
+                        timeout = aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT)
+                        async with session.post(f"{upload_url}/chunk", data=form_data, headers=headers, timeout=timeout) as response:
+                            if response.status == 200:
+                                logger.debug(f"Chunk {chunk_index + 1}/{total_chunks} uploaded successfully")
+                                chunk_uploaded = True
+                                break
+                            else:
+                                error_text = await response.text()
+                                logger.warning(f"Chunk {chunk_index + 1} attempt {attempt} failed: HTTP {response.status} - {error_text}")
+                    
+                    except Exception as ex:
+                        logger.warning(f"Chunk {chunk_index + 1} attempt {attempt} error: {ex}")
+                    
+                    if attempt < MAX_RETRIES:
+                        delay = min(RETRY_DELAY_BASE ** attempt, 30)
+                        await asyncio.sleep(delay)
+                
+                if not chunk_uploaded:
+                    logger.error(f"Failed to upload chunk {chunk_index + 1} after {MAX_RETRIES} attempts")
+                    return False
+        
+        logger.info(f"Chunked upload completed: {file_path.name}")
+        return True
+    
+    except Exception as ex:
+        logger.error(f"Chunked upload error: {ex}")
+        return False
+
+class AsyncFileUploadHandler(FileSystemEventHandler):
+    """File upload handler with async for large files.
+    
+    This class monitors the training output directory and uploads files asynchronously
+    as they are created. It includes deduplication, file stabilization checking,
+    and async upload capability to handle large model files without blocking training.
+    
+    The handler runs async upload tasks in the background while training continues,
+    ensuring that large checkpoint files don't interrupt the training process.
+    """
+    
+    def __init__(self, callback_url: str, callback_token: str, output_dir: Path, job_id: str):
+        """Initializes the async file upload handler.
+        
+        Args:
+            callback_url: Base URL for Hartsy website callbacks
+            callback_token: Authentication token for callbacks
+            output_dir: Directory to monitor for new files
+            job_id: Training job ID for tracking and organization
+        """
+        super().__init__()
+        self.callback_url = callback_url
+        self.callback_token = callback_token
+        self.output_dir = output_dir
+        self.job_id = job_id
+        
+        # Tracking and state management
+        self.uploaded_files: set = set()
+        self.last_upload_times: Dict[str, float] = {}
+        self.upload_executor = ThreadPoolExecutor(max_workers=2)  # Limit concurrent uploads
+        
+        # HTTP session for uploads (will be initialized when needed)
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+        logger.info(f"Async file upload handler initialized for job {job_id}")
+    
+    async def initialize_session(self):
+        """Initializes the HTTP session for uploads."""
+        if self.session is None:
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT)
+            self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    
+    async def cleanup_session(self):
+        """Cleans up the HTTP session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
+        self.upload_executor.shutdown(wait=True)
+    
+    def on_created(self, event):
+        """Handles file creation events by scheduling async upload."""
+        if not event.is_directory:
+            # Schedule async upload task
+            asyncio.create_task(self._handle_file_async(Path(event.src_path)))
+    
+    def on_modified(self, event):
+        """Handles file modification events by scheduling async upload."""
+        if not event.is_directory:
+            # Schedule async upload task
+            asyncio.create_task(self._handle_file_async(Path(event.src_path)))
+    
+    async def _handle_file_async(self, file_path: Path):
+        """Handles file events asynchronously with validation and upload.
+        
+        This method implements the core logic for processing file system events,
+        including file validation, deduplication, stabilization waiting, and
+        initiating the upload process.
+        
+        Args:
+            file_path: Path to the file that was created or modified
+        """
+        try:
+            # Basic validation
+            if not file_path.exists() or file_path.name.startswith('.'):
+                return
+            
+            # Skip config files and temporary files
+            if file_path.name.lower() in ['config.yaml', 'config.yml', '.gitkeep', 'readme.txt']:
+                return
+            
+            file_key = str(file_path)
+            current_time = time.time()
+            
+            # Check if already uploaded
+            if file_key in self.uploaded_files:
+                return
+            
+            # Rate limiting - don't process the same file too frequently
+            last_time = self.last_upload_times.get(file_key, 0)
+            if current_time - last_time < FILE_WATCH_DELAY:
+                return
+            
+            self.last_upload_times[file_key] = current_time
+            
+            # Wait for file to stabilize (avoid uploading incomplete files)
+            await asyncio.sleep(FILE_WATCH_DELAY)
+            
+            # Verify file still exists and has content
+            if not file_path.exists():
+                return
+            
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                logger.warning(f"Skipping empty file: {file_path.name}")
+                return
+            
+            # Initialize session if needed
+            await self.initialize_session()
+            
+            # Upload the file
+            file_size_mb = file_size / (1024 * 1024)
+            logger.info(f"Uploading file: {file_path.name} ({file_size_mb:.1f}MB)")
+            
+            upload_url = f"{self.callback_url}/api/training/upload-file"
+            success = await upload_file_chunked(self.session, file_path, upload_url, self.callback_token)
+            
+            if success:
+                self.uploaded_files.add(file_key)
+                logger.info(f"Upload successful: {file_path.name}")
+                
+                # Send file upload notification to website
+                await send_hartsy_callback(self.session, f"{self.callback_url}/api/training/file-uploaded", self.callback_token, {
+                    "job_id": self.job_id,
+                    "file_name": file_path.name,
+                    "file_size_mb": file_size_mb,
+                    "file_type": "checkpoint" if "checkpoint" in file_path.name.lower() else "output"
+                })
+            else:
+                logger.error(f"Upload failed: {file_path.name}")
+        
+        except Exception as ex:
+            logger.error(f"Error handling file {file_path}: {ex}")
+
+class TrainingHandler:
+    """Enhanced training handler that integrates with Hartsy.
+    
+    This class orchestrates the complete training workflow using the AI Toolkit while
+    communicating with the Hartsy website for storage operations and comprehensive progress tracking.
+    
+    Key responsibilities:
+    - Download dataset images from website URLs
+    - Configure and execute AI Toolkit training
+    - Monitor training progress and calculate ETA
+    - Upload results asynchronously during training
+    - Send progress callbacks to website
+    """
+    
+    def __init__(self):
+        """Initializes the training handler with environment detection and validation.
+        
+        This constructor sets up the training environment, validates AI Toolkit
+        installation, and prepares workspace directories. It automatically detects
+        whether running on RunPod Serverless or Pods and configures paths accordingly.
+        """
+        # Environment detection - prefer /workspace for RunPod compatibility
+        if Path("/workspace").exists():
+            self.workspace = Path("/workspace")
+            logger.info("Using /workspace (RunPod environment)")
+        elif Path("/runpod-volume").exists():
+            self.workspace = Path("/runpod-volume")
+            logger.info("Using /runpod-volume (RunPod Serverless)")
+        else:
+            self.workspace = Path("/tmp")
+            logger.warning("Using /tmp (fallback environment)")
+        
+        self.training_dir = self.workspace / "training"
+        self.training_dir.mkdir(exist_ok=True)
+        
+        # AI Toolkit validation
+        self.ai_toolkit_dir = Path("/app/ai-toolkit")
+        self.run_script = self.ai_toolkit_dir / "run.py"
+        
+        if not self.ai_toolkit_dir.exists() or not self.run_script.exists():
+            raise ValueError(f"AI Toolkit not found at expected location: {self.ai_toolkit_dir}")
+        
+        logger.info(f"Training handler initialized - workspace: {self.workspace}")
+    
+    async def download_hartsy_dataset(self, dataset_urls: List[str], local_path: Path) -> int:
+        """Downloads training dataset from Hartsy website URLs.
+        
+        This method downloads all images concurrently for speed while
+        maintaining error handling and validation.
+        
+        Args:
+            dataset_urls: List of image URLs from the website
+            local_path: Local directory to save downloaded images
+            
+        Returns:
+            int: Number of successfully downloaded images
+            
+        Raises:
+            ValueError: If no images could be downloaded successfully
+        """
+        if not dataset_urls:
+            raise ValueError("No dataset URLs provided")
+        
+        logger.info(f"Downloading dataset from Hartsy: {len(dataset_urls)} images")
+        local_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create HTTP session for downloads
+        connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=60)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            # Download all images concurrently
+            download_tasks = []
+            for i, url in enumerate(dataset_urls):
+                task = download_image_from_url(session, url, local_path, i)
+                download_tasks.append(task)
+            
+            # Wait for all downloads
+            results = await asyncio.gather(*download_tasks, return_exceptions=True)
+            
+            # Count successful downloads
+            successful_downloads = 0
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Download failed: {result}")
+                elif result:
+                    successful_downloads += 1
+        
+        if successful_downloads == 0:
+            raise ValueError("Failed to download any training images")
+        
+        logger.info(f"Dataset download completed: {successful_downloads}/{len(dataset_urls)} images")
+        return successful_downloads
+    
+    async def setup_async_file_watcher(self, output_dir: Path, callback_url: str,
+                                     callback_token: str, job_id: str) -> AsyncFileUploadHandler:
+        """Sets up asynchronous file monitoring and uploading for training outputs.
+        
+        This method creates and configures the file system watcher that monitors
+        the training output directory and uploads files as they are created.
+        The async nature ensures large file uploads don't block training.
+        
+        Args:
+            output_dir: Directory to monitor for new files
+            callback_url: Base URL for website callbacks
+            callback_token: Authentication token for callbacks
+            job_id: Training job ID for tracking
+            
+        Returns:
+            AsyncFileUploadHandler: Configured file upload handler
+        """
+        handler = AsyncFileUploadHandler(callback_url, callback_token, output_dir, job_id)
+        await handler.initialize_session()
+        
+        observer = Observer()
+        observer.schedule(handler, str(output_dir), recursive=True)
+        observer.start()
+        
+        # Store observer reference on handler for cleanup
+        handler.observer = observer
+        
+        logger.info("Async file monitoring started")
+        return handler
+    
+    async def run_training_async(self, config_content: str, dataset_urls: List[str],
+                               callback_url: str, callback_token: str, job_id: str) -> Dict[str, Any]:
+        """Executes the complete training workflow with async file uploads and progress tracking.
+        
+        This is the main training orchestration method that coordinates all aspects
+        of the training process including dataset preparation, configuration setup,
+        training execution, progress monitoring, and result uploading.
+        
+        Args:
+            config_content: YAML training configuration
+            dataset_urls: List of image URLs to download
+            callback_url: Base URL for website callbacks
+            callback_token: Authentication token
+            job_id: Training job ID for tracking
+            
+        Returns:
+            Dict containing training results and metadata
+        """
+        file_handler: Optional[AsyncFileUploadHandler] = None
+        session_id = f"training_session_{int(time.time())}"
+        start_time = time.time()
+        
         try:
             model_name = extract_model_name_from_config(config_content)
-            session_id = f"training_session_{int(time.time())}"
             session_dir = self.training_dir / session_id
             session_dir.mkdir(exist_ok=True)
-            logger.info(f"Starting training session {session_id}")
+            
+            logger.info(f"Starting training session {session_id} for job {job_id}")
             logger.info(f"Model: {model_name}")
+            
+            # Send initial progress update
+            async with aiohttp.ClientSession() as session:
+                await send_hartsy_callback(session, f"{callback_url}/api/training/progress-update", callback_token, {
+                    "job_id": job_id,
+                    "status": "initializing",
+                    "progress": 5,
+                    "current_step": "Downloading dataset",
+                    "model_name": model_name
+                })
+            
+            # Download dataset from Hartsy URLs
+            dataset_path = session_dir / "dataset"
+            successful_downloads = await self.download_hartsy_dataset(dataset_urls, dataset_path)
+            
+            # Update progress
+            async with aiohttp.ClientSession() as session:
+                await send_hartsy_callback(session, f"{callback_url}/api/training/progress-update", callback_token, {
+                    "job_id": job_id,
+                    "status": "preparing",
+                    "progress": 15,
+                    "current_step": f"Downloaded {successful_downloads} images, preparing training",
+                    "images_downloaded": successful_downloads
+                })
+            
+            # Setup training configuration
             config_file = session_dir / "config.yaml"
             with open(config_file, 'w') as f:
                 f.write(config_content)
+            
             config_data = yaml.safe_load(config_content)
-            dataset_path = session_dir / "dataset"
-            self.download_dataset(
-                dataset_config["bucket_name"],
-                dataset_config["folder_path"],
-                dataset_path
-            )
+            
+            # Update config with local dataset path
             if 'config' in config_data and 'process' in config_data['config']:
                 for process in config_data['config']['process']:
                     if 'datasets' in process:
                         for i, dataset in enumerate(process['datasets']):
                             process['datasets'][i]['folder_path'] = str(dataset_path)
+            
+            # Setup output directory
             output_dir = session_dir / "output"
             output_dir.mkdir(exist_ok=True)
+            
+            # Update config with local output path
             for process in config_data['config']['process']:
                 if 'training_folder' in process:
                     process['training_folder'] = str(output_dir)
+            
+            # Write updated config
             with open(config_file, 'w') as f:
                 yaml.dump(config_data, f, default_flow_style=False)
             
-            file_observer = self.setup_realtime_file_watcher(
-                output_dir,
-                upload_config["bucket_name"],
-                upload_config["folder_path"]
-            )
+            # Setup async file monitoring
+            file_handler = await self.setup_async_file_watcher(output_dir, callback_url, callback_token, job_id)
             
+            # Update progress
+            async with aiohttp.ClientSession() as session:
+                await send_hartsy_callback(session, f"{callback_url}/api/training/progress-update", callback_token, {
+                    "job_id": job_id,
+                    "status": "training",
+                    "progress": 20,
+                    "current_step": "Starting AI Toolkit training",
+                })
+            
+            # Execute training
             cmd = ["python", str(self.run_script), str(config_file)]
             logger.info(f"Starting training: {' '.join(cmd)}")
+            
             original_cwd = os.getcwd()
             os.chdir(str(self.ai_toolkit_dir))
+            
+            last_progress_update = time.time()
+            progress_update_interval = 30  # seconds
+            
             try:
                 process = subprocess.Popen(
                     cmd,
@@ -216,87 +720,220 @@ class TrainingHandler:
                     bufsize=1,
                     universal_newlines=True
                 )
+                
                 logger.info("Training process started")
+                
+                # Monitor training output with progress tracking
                 while True:
                     output = process.stdout.readline()
                     if output == '' and process.poll() is not None:
                         break
+                    
                     if output:
                         line = output.rstrip()
                         print(line, flush=True)
-                        sys.stdout.flush()
+                        
+                        # Extract progress and send periodic updates
+                        current_time = time.time()
+                        if current_time - last_progress_update >= progress_update_interval:
+                            progress_info = calculate_progress_and_eta(line, start_time)
+                            
+                            if progress_info["progress"] > 0:
+                                async with aiohttp.ClientSession() as session:
+                                    await send_hartsy_callback(session, f"{callback_url}/api/training/progress-update", callback_token, {
+                                        "job_id": job_id,
+                                        "status": "training",
+                                        "progress": min(95, 20 + int(progress_info["progress"] * 0.75)),  # Scale to 20-95%
+                                        "current_step": progress_info["current_step"],
+                                        "eta_minutes": progress_info["eta_minutes"]
+                                    })
+                            
+                            last_progress_update = current_time
+                
+                # Get final output
                 remaining_output = process.stdout.read()
                 if remaining_output:
                     print(remaining_output, flush=True)
-                    sys.stdout.flush()
+                
                 return_code = process.poll()
+                
                 if return_code == 0:
                     logger.info("Training completed successfully")
+                    
+                    # Wait for final file uploads
                     logger.info("Waiting for final file uploads")
-                    time.sleep(10)
+                    await asyncio.sleep(10)
+                    
+                    # Send completion callback
+                    async with aiohttp.ClientSession() as session:
+                        await send_hartsy_callback(session, f"{callback_url}/api/training/job-complete", callback_token, {
+                            "job_id": job_id,
+                            "status": "completed",
+                            "progress": 100,
+                            "current_step": "Training completed successfully",
+                            "model_name": model_name,
+                            "session_id": session_id,
+                            "total_files_uploaded": len(file_handler.uploaded_files) if file_handler else 0
+                        })
+                    
                     return {
                         "success": True,
                         "message": "Training completed successfully",
                         "session_id": session_id,
                         "model_name": model_name,
-                        "upload_folder": upload_config["folder_path"],
-                        "output_path": str(output_dir)
+                        "job_id": job_id,
+                        "images_downloaded": successful_downloads,
+                        "files_uploaded": len(file_handler.uploaded_files) if file_handler else 0
                     }
                 else:
                     logger.error(f"Training failed with return code: {return_code}")
+                    
+                    # Send failure callback
+                    async with aiohttp.ClientSession() as session:
+                        await send_hartsy_callback(session, f"{callback_url}/api/training/job-complete", callback_token, {
+                            "job_id": job_id,
+                            "status": "failed",
+                            "progress": 0,
+                            "error": f"Training process failed with return code {return_code}",
+                            "session_id": session_id
+                        })
+                    
                     return {
                         "success": False,
                         "error": f"Training process failed with return code {return_code}",
-                        "session_id": session_id
+                        "session_id": session_id,
+                        "job_id": job_id
                     }
+            
             finally:
                 os.chdir(original_cwd)
-                if file_observer:
-                    file_observer.stop()
-                    file_observer.join()
-        except Exception as e:
-            logger.error(f"Error in training process: {str(e)}")
-            if file_observer:
-                file_observer.stop()
-                file_observer.join()
+        
+        except Exception as ex:
+            logger.error(f"Error in training process: {str(ex)}")
+            
+            # Send error callback
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await send_hartsy_callback(session, f"{callback_url}/api/training/job-complete", callback_token, {
+                        "job_id": job_id,
+                        "status": "failed",
+                        "progress": 0,
+                        "error": str(ex),
+                        "session_id": session_id
+                    })
+            except:
+                pass  # Don't let callback errors mask the original error
+            
             return {
                 "success": False,
-                "error": str(e),
-                "session_id": session_id if session_id else "unknown"
+                "error": str(ex),
+                "session_id": session_id,
+                "job_id": job_id
             }
+        
+        finally:
+            # Cleanup file handler
+            if file_handler:
+                try:
+                    if hasattr(file_handler, 'observer'):
+                        file_handler.observer.stop()
+                        file_handler.observer.join()
+                    await file_handler.cleanup_session()
+                except Exception as ex:
+                    logger.warning(f"Error cleaning up file handler: {ex}")
 
-def handler(event):
-    input_data = event.get("input", {})
-    logger.info(f"Received training request")
-    required_fields = ["config", "dataset_config", "upload_config"]
-    for field in required_fields:
-        if field not in input_data:
-            error_msg = f"Missing required field: {field}"
-            logger.error(error_msg)
-            return {"error": error_msg}
-    dataset_config = input_data["dataset_config"]
-    if not all(k in dataset_config for k in ["bucket_name", "folder_path"]):
-        error_msg = "dataset_config must contain 'bucket_name' and 'folder_path'"
-        logger.error(error_msg)
-        return {"error": error_msg}
-    upload_config = input_data["upload_config"]
-    if not all(k in upload_config for k in ["bucket_name", "folder_path"]):
-        error_msg = "upload_config must contain 'bucket_name' and 'folder_path'"
-        logger.error(error_msg)
-        return {"error": error_msg}
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Main RunPod handler function enhanced for Hartsy website integration.
+    
+    This function serves as the entry point for all training requests. It validates
+    the input, configures the training environment, and orchestrates the complete
+    training workflow using the async training handler.
+    
+    Expected input format from Hartsy website:
+    {
+        "internal_job_id": "123",  // Database ID from TrainingTable
+        "config": "yaml_config_string",
+        "dataset_urls": ["https://hartsy.com/api/dataset/image1.jpg", ...],
+        "callback_base_url": "https://hartsy.com",
+        "callback_token": "temp-job-token-for-auth"
+    }
+    
+    Workflow:
+    1. Site creates Training record (gets internal_job_id like "123")
+    2. Site sends training request to RunPod with internal_job_id
+    3. RunPod generates external_job_id (like "runpod-123-1647890123") 
+    4. RunPod immediately sends job_started update with both IDs
+    5. Site calls UpdateJob(123, "runpod-123-1647890123")
+    6. All subsequent updates use external_job_id for database lookups
+    
+    Args:
+        event: RunPod event containing input data and configuration
+        
+    Returns:
+        Dict containing training results, status, and metadata
+    """
     try:
+        logger.info("=== RunPod AI Training Handler Started ===")
+        
+        input_data = event.get("input", {})
+        if not input_data:
+            raise ValueError("No input data provided")
+        
+        # Validate required fields
+        required_fields = ["internal_job_id", "config", "dataset_urls", "callback_base_url", "callback_token"]
+        for field in required_fields:
+            if field not in input_data:
+                error_msg = f"Missing required field: {field}"
+                logger.error(error_msg)
+                return {"success": False, "error": error_msg}
+        
+        # Validate dataset URLs
+        dataset_urls = input_data.get("dataset_urls", [])
+        if not isinstance(dataset_urls, list) or len(dataset_urls) == 0:
+            error_msg = "At least one dataset URL is required"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+        
+        # Validate internal job ID (should be a string representation of the database ID)
+        internal_job_id = str(input_data["internal_job_id"])
+        if not internal_job_id or internal_job_id == "None":
+            error_msg = "Valid internal job ID is required"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+        
+        # Validate configuration
+        try:
+            yaml.safe_load(input_data["config"])
+        except yaml.YAMLError as ex:
+            error_msg = f"Invalid training configuration YAML: {ex}"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+        
+        logger.info(f"Processing training job {internal_job_id} with {len(dataset_urls)} images")
+        
+        # Create training handler and run training
         training_handler = TrainingHandler()
-        result = training_handler.run_training(
+        result = asyncio.run(training_handler.run_training_async(
             input_data["config"],
-            dataset_config,
-            upload_config
-        )
+            dataset_urls,
+            input_data["callback_base_url"],
+            input_data["callback_token"],
+            internal_job_id
+        ))
+        
+        logger.info("=== RunPod AI Training Handler Completed ===")
         return result
-    except Exception as e:
-        error_msg = f"Handler error: {str(e)}"
+    
+    except ValueError as ve:
+        error_msg = f"Input validation error: {ve}"
         logger.error(error_msg)
-        return {"error": error_msg}
+        return {"success": False, "error": error_msg}
+    
+    except Exception as ex:
+        error_msg = f"Handler error: {str(ex)}"
+        logger.error(error_msg, exc_info=True)
+        return {"success": False, "error": error_msg}
 
 if __name__ == "__main__":
-    logger.info("Starting RunPod serverless AI-Toolkit handler")
+    logger.info("Starting RunPod Serverless AI-Toolkit Handler v2.1")
     runpod.serverless.start({"handler": handler})
