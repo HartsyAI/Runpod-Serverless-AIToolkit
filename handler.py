@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 def init_supabase_client() -> Client:
     supabase_url = os.environ.get("SUPABASE_URL")
-    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
+    supabase_key = os.environ.get("SUPABASE_SECRET_KEY")
     if not supabase_url or not supabase_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are required")
+        raise ValueError("SUPABASE_URL and SUPABASE_SECRET_KEY environment variables are required")
     return create_client(supabase_url, supabase_key)
 
 def extract_model_name_from_config(config_content: str) -> str:
