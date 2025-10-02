@@ -5,7 +5,7 @@ This handler uses the Hartsy website as a storage gateway with async file upload
 chunked upload support for large files, and callback functionality.
 
 Features:
-- Downloads dataset from website URLs instead of Supabase
+- Downloads dataset ZIP from website URL and extracts locally
 - Async file uploads during training (2-40GB support)
 - Chunked uploads with resume capability
 - Real-time progress callbacks to website
@@ -13,7 +13,7 @@ Features:
 - 5 retry attempts over 10 minutes for failed uploads
 
 Author: Kalebbroo, Hartsy LLC
-Version: 2.1
+Version: 2.2
 """
 
 import json
@@ -26,6 +26,8 @@ import sys
 import asyncio
 import aiohttp
 import aiofiles
+import zipfile
+import io
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -142,63 +144,6 @@ def calculate_progress_and_eta(log_line: str, start_time: float) -> Dict[str, An
     
     return progress_info
 
-async def download_image_from_url(session: aiohttp.ClientSession, url: str, 
-                                save_path: Path, index: int) -> bool:
-    """Downloads a single training image from URL with error handling and validation.
-    
-    This function downloads images for the training dataset, handling various edge cases
-    like invalid URLs, network timeouts, and file validation. It generates safe filenames
-    and validates downloaded content to ensure training data quality.
-    
-    Args:
-        session: HTTP session for making requests
-        url: Image URL to download
-        save_path: Directory to save the image
-        index: Image index for filename generation
-        
-    Returns:
-        bool: True if download was successful, False otherwise
-    """
-    try:
-        # Generate safe filename from URL or use index
-        parsed_url = urlparse(url)
-        filename = Path(parsed_url.path).name
-        
-        if not filename or '.' not in filename:
-            filename = f"image_{index:04d}.jpg"
-        
-        # Sanitize filename for filesystem compatibility
-        filename = "".join(c for c in filename if c.isalnum() or c in '._-')
-        if not filename:
-            filename = f"image_{index:04d}.jpg"
-        
-        file_path = save_path / filename
-        
-        # Download with timeout
-        timeout = aiohttp.ClientTimeout(total=60)
-        async with session.get(url, timeout=timeout) as response:
-            if response.status != 200:
-                logger.warning(f"Failed to download {url}: HTTP {response.status}")
-                return False
-            
-            content = await response.read()
-            
-            # Validate downloaded content
-            if len(content) < 1024:  # Less than 1KB is suspicious
-                logger.warning(f"Downloaded image {filename} is too small ({len(content)} bytes)")
-                return False
-            
-            # Save to file
-            async with aiofiles.open(file_path, 'wb') as f:
-                await f.write(content)
-            
-            logger.debug(f"Downloaded {filename}: {len(content) / 1024:.1f}KB")
-            return True
-    
-    except Exception as ex:
-        logger.warning(f"Failed to download {url}: {ex}")
-        return False
-
 async def send_hartsy_callback(session: aiohttp.ClientSession, callback_url: str, 
                               callback_token: str, data: Dict[str, Any]) -> bool:
     """Sends callback to Hartsy website with retry logic and error handling.
@@ -219,7 +164,7 @@ async def send_hartsy_callback(session: aiohttp.ClientSession, callback_url: str
     headers = {
         'Authorization': f'Bearer {callback_token}',
         'Content-Type': 'application/json',
-        'User-Agent': 'RunPod-TrainingHandler/2.1'
+        'User-Agent': 'RunPod-TrainingHandler/2.2'
     }
     
     for attempt in range(1, MAX_RETRIES + 1):
@@ -271,7 +216,7 @@ async def upload_file_chunked(session: aiohttp.ClientSession, file_path: Path,
     
     headers = {
         'Authorization': f'Bearer {callback_token}',
-        'User-Agent': 'RunPod-TrainingHandler/2.1'
+        'User-Agent': 'RunPod-TrainingHandler/2.2'
     }
     
     # For files under 50MB, use regular upload
@@ -491,7 +436,7 @@ class TrainingHandler:
     communicating with the Hartsy website for storage operations and comprehensive progress tracking.
     
     Key responsibilities:
-    - Download dataset images from website URLs
+    - Download and extract dataset ZIP from website URL
     - Configure and execute AI Toolkit training
     - Monitor training progress and calculate ETA
     - Upload results asynchronously during training
@@ -528,55 +473,62 @@ class TrainingHandler:
         
         logger.info(f"Training handler initialized - workspace: {self.workspace}")
     
-    async def download_hartsy_dataset(self, dataset_urls: List[str], local_path: Path) -> int:
-        """Downloads training dataset from Hartsy website URLs.
+    async def download_and_extract_dataset(self, dataset_urls: List[str], local_path: Path) -> int:
+        """Downloads dataset ZIP from Hartsy website and extracts images locally.
         
-        This method downloads all images concurrently for speed while
-        maintaining error handling and validation.
+        This method downloads the dataset archive and extracts it for AI Toolkit training.
+        It validates the extracted content and ensures proper image formats.
         
         Args:
-            dataset_urls: List of image URLs from the website
-            local_path: Local directory to save downloaded images
+            dataset_urls: List containing the dataset ZIP URL (uses first URL)
+            local_path: Local directory to extract images to
             
         Returns:
-            int: Number of successfully downloaded images
+            int: Number of successfully extracted images
             
         Raises:
-            ValueError: If no images could be downloaded successfully
+            ValueError: If download fails or no valid images found
         """
         if not dataset_urls:
             raise ValueError("No dataset URLs provided")
         
-        logger.info(f"Downloading dataset from Hartsy: {len(dataset_urls)} images")
+        zip_url = dataset_urls[0]  # Use first URL (should be the dataset ZIP)
+        logger.info(f"Downloading dataset ZIP from Hartsy: {zip_url}")
         local_path.mkdir(parents=True, exist_ok=True)
         
-        # Create HTTP session for downloads
-        connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-        timeout = aiohttp.ClientTimeout(total=60)
+        # Create HTTP session for download
+        connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout for large ZIPs
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            # Download all images concurrently
-            download_tasks = []
-            for i, url in enumerate(dataset_urls):
-                task = download_image_from_url(session, url, local_path, i)
-                download_tasks.append(task)
-            
-            # Wait for all downloads
-            results = await asyncio.gather(*download_tasks, return_exceptions=True)
-            
-            # Count successful downloads
-            successful_downloads = 0
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Download failed: {result}")
-                elif result:
-                    successful_downloads += 1
+            # Download the ZIP file
+            async with session.get(zip_url, timeout=timeout) as response:
+                if response.status != 200:
+                    raise ValueError(f"Failed to download dataset ZIP: HTTP {response.status}")
+                
+                zip_data = await response.read()
+                logger.info(f"Downloaded ZIP: {len(zip_data) / 1024 / 1024:.1f}MB")
         
-        if successful_downloads == 0:
-            raise ValueError("Failed to download any training images")
+        # Extract ZIP (zipfile module is synchronous)
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zip_ref:
+                zip_ref.extractall(local_path)
+                logger.info(f"Extracted ZIP to {local_path}")
+        except zipfile.BadZipFile as ex:
+            raise ValueError(f"Invalid ZIP file: {ex}")
         
-        logger.info(f"Dataset download completed: {successful_downloads}/{len(dataset_urls)} images")
-        return successful_downloads
+        # Count and validate extracted images
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+        image_files = [f for f in local_path.iterdir() if f.suffix.lower() in image_extensions]
+        
+        # Also check for caption files
+        caption_files = [f for f in local_path.iterdir() if f.suffix.lower() == '.txt']
+        
+        if len(image_files) == 0:
+            raise ValueError("No valid images found in dataset ZIP")
+        
+        logger.info(f"Extracted {len(image_files)} images and {len(caption_files)} caption files")
+        return len(image_files)
     
     async def setup_async_file_watcher(self, output_dir: Path, callback_url: str,
                                      callback_token: str, job_id: str) -> AsyncFileUploadHandler:
@@ -618,7 +570,7 @@ class TrainingHandler:
         
         Args:
             config_content: YAML training configuration
-            dataset_urls: List of image URLs to download
+            dataset_urls: List containing dataset ZIP URL
             callback_url: Base URL for website callbacks
             callback_token: Authentication token
             job_id: Training job ID for tracking
@@ -648,9 +600,9 @@ class TrainingHandler:
                     "model_name": model_name
                 })
             
-            # Download dataset from Hartsy URLs
+            # Download and extract dataset from Hartsy ZIP URL
             dataset_path = session_dir / "dataset"
-            successful_downloads = await self.download_hartsy_dataset(dataset_urls, dataset_path)
+            successful_downloads = await self.download_and_extract_dataset(dataset_urls, dataset_path)
             
             # Update progress
             async with aiohttp.ClientSession() as session:
@@ -658,7 +610,7 @@ class TrainingHandler:
                     "job_id": job_id,
                     "status": "preparing",
                     "progress": 15,
-                    "current_step": f"Downloaded {successful_downloads} images, preparing training",
+                    "current_step": f"Extracted {successful_downloads} images, preparing training",
                     "images_downloaded": successful_downloads
                 })
             
@@ -853,18 +805,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     {
         "internal_job_id": "123",  // Database ID from TrainingTable
         "config": "yaml_config_string",
-        "dataset_urls": ["https://hartsy.com/api/dataset/image1.jpg", ...],
+        "dataset_urls": ["https://storage.supabase.com/.../dataset.zip"],
         "callback_base_url": "https://hartsy.com",
         "callback_token": "temp-job-token-for-auth"
     }
-    
-    Workflow:
-    1. Site creates Training record (gets internal_job_id like "123")
-    2. Site sends training request to RunPod with internal_job_id
-    3. RunPod generates external_job_id (like "runpod-123-1647890123") 
-    4. RunPod immediately sends job_started update with both IDs
-    5. Site calls UpdateJob(123, "runpod-123-1647890123")
-    6. All subsequent updates use external_job_id for database lookups
     
     Args:
         event: RunPod event containing input data and configuration
@@ -909,7 +853,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
         
-        logger.info(f"Processing training job {internal_job_id} with {len(dataset_urls)} images")
+        logger.info(f"Processing training job {internal_job_id} with dataset ZIP: {dataset_urls[0]}")
         
         # Create training handler and run training
         training_handler = TrainingHandler()
@@ -935,5 +879,5 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": error_msg}
 
 if __name__ == "__main__":
-    logger.info("Starting RunPod Serverless AI-Toolkit Handler v2.1")
+    logger.info("Starting RunPod Serverless AI-Toolkit Handler v2.2")
     runpod.serverless.start({"handler": handler})
