@@ -794,7 +794,7 @@ class TrainingHandler:
                 except Exception as ex:
                     logger.warning(f"Error cleaning up file handler: {ex}")
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """Main RunPod handler function enhanced for Hartsy website integration.
     
     This function serves as the entry point for all training requests. It validates
@@ -857,7 +857,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         
         # Create training handler and run training
         training_handler = TrainingHandler()
-        result = asyncio.run(training_handler.run_training_async(
+        result = await training_handler.run_training_async(
             input_data["config"],
             dataset_urls,
             input_data["callback_base_url"],
