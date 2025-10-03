@@ -863,7 +863,7 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             input_data["callback_base_url"],
             input_data["callback_token"],
             internal_job_id
-        ))
+        )
         
         logger.info("=== RunPod AI Training Handler Completed ===")
         return result
