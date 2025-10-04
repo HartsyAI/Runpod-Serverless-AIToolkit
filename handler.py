@@ -50,6 +50,7 @@ RABBITMQ_EXCHANGE = os.environ.get('RABBITMQ_EXCHANGE', 'hartsy.training')
 
 class RabbitMQConnectionManager:
     """Manages persistent RabbitMQ connection with automatic reconnection."""
+    
     _connection: Optional[aio_pika.Connection] = None
     _channel: Optional[aio_pika.Channel] = None
     _exchange: Optional[aio_pika.Exchange] = None
@@ -579,7 +580,7 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
         # Cleanup RabbitMQ connection
         await RabbitMQConnectionManager.cleanup()
 
-async def handler_async(event: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """Async RunPod handler entry point."""
     try:
         logger.info("=== RunPod AI Training Handler Started ===")
@@ -594,10 +595,6 @@ async def handler_async(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as ex:
         logger.error(f"Handler error: {str(ex)}", exc_info=True)
         return {"success": False, "error": str(ex)}
-
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronous wrapper for RunPod serverless."""
-    return asyncio.run(handler_async(event))
 
 if __name__ == "__main__":
     logger.info("Starting RunPod Serverless AI-Toolkit Handler v3.1")
