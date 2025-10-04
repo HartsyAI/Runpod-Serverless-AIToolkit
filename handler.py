@@ -356,11 +356,11 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
             "job_id": job_id
         }
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """RunPod handler entry point."""
     try:
         logger.info("=== RunPod AI Training Handler Started ===")
-        return asyncio.run(run_training(event))
+        return await run_training(event)
     except Exception as ex:
         logger.error(f"Handler error: {str(ex)}", exc_info=True)
         return {"success": False, "error": str(ex)}
