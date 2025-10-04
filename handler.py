@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 NETWORK_VOLUME_PATH = Path(os.environ.get('NETWORK_VOLUME_PATH', '/runpod-volume'))
 RABBITMQ_URL = os.environ.get('RABBITMQ_URL', '')
-RABBITMQ_EXCHANGE = os.environ.get('RABBITMQ_EXCHANGE', 'hartsy.training')
+RABBITMQ_EXCHANGE = os.environ.get('RABBITMQ_EXCHANGE', 'training.events')
 
 class RabbitMQConnectionManager:
     """Manages persistent RabbitMQ connection with automatic reconnection."""
@@ -93,19 +93,24 @@ class RabbitMQConnectionManager:
         async with cls._lock:
             if cls._channel is None or cls._channel.is_closed:
                 cls._channel = await cls._connection.channel()
-                
                 # Declare exchange
                 cls._exchange = await cls._channel.declare_exchange(
                     RABBITMQ_EXCHANGE,
                     aio_pika.ExchangeType.TOPIC,
                     durable=True
                 )
-                
+                # Declare queue (ensures it exists even if consumer isn't running)
+                queue_name = "training.events"
+                queue = await cls._channel.declare_queue(
+                    queue_name,
+                    durable=True,
+                    auto_delete=False
+                )
+                # Bind queue to exchange with wildcard pattern
+                await queue.bind(cls._exchange, routing_key="training.*")
+                logger.info(f"RabbitMQ channel, exchange, and queue '{queue_name}' ready")
                 # Enable publisher confirms
                 await cls._channel.set_qos(prefetch_count=1)
-                
-                logger.info("RabbitMQ channel and exchange ready")
-        
         return cls._channel
 
     @classmethod
