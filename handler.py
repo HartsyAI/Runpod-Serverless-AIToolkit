@@ -234,10 +234,17 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
     
     return False
 
-def to_pascal_case(snake_str: str) -> str:
-    """Converts snake_case to PascalCase for C# compatibility."""
+def to_camel_case(snake_str: str) -> str:
+    """Converts snake_case to camelCase for C# JSON compatibility."""
     components = snake_str.split('_')
-    return ''.join(x.title() for x in components)
+    # First component stays lowercase, rest are capitalized
+    return components[0] + ''.join(x.title() for x in components[1:])
+
+def to_camel_case(snake_str: str) -> str:
+    """Converts snake_case to camelCase for C# JSON compatibility."""
+    components = snake_str.split('_')
+    # First component stays lowercase, rest are capitalized
+    return components[0] + ''.join(x.title() for x in components[1:])
 
 def extract_model_name_from_config(config_content: str) -> str:
     """Extracts model name from YAML configuration."""
