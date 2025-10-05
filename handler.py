@@ -95,23 +95,14 @@ class RabbitMQConnectionManager:
         async with cls._lock:
             if cls._channel is None or cls._channel.is_closed:
                 cls._channel = await cls._connection.channel()
-                # Declare exchange
+                # Declare exchange (publishers only need the exchange)
                 cls._exchange = await cls._channel.declare_exchange(
                     RABBITMQ_EXCHANGE,
                     aio_pika.ExchangeType.TOPIC,
                     durable=True
                 )
-                # Declare queue (ensures it exists even if consumer isn't running)
-                queue_name = "training.events"
-                queue = await cls._channel.declare_queue(
-                    queue_name,
-                    durable=True,
-                    auto_delete=False
-                )
-                # Bind queue to exchange with wildcard pattern
-                await queue.bind(cls._exchange, routing_key="training.*")
-                logger.info(f"RabbitMQ channel, exchange, and queue '{queue_name}' ready")
-                # Enable publisher confirms
+                logger.info(f"RabbitMQ channel and exchange '{RABBITMQ_EXCHANGE}' ready")
+                # Enable publisher confirms for guaranteed delivery
                 await cls._channel.set_qos(prefetch_count=1)
         return cls._channel
 
@@ -453,13 +444,16 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
             'progress': 20,
             'current_step': 'AI Toolkit training started'
         })
+        
         # Execute training with detailed progress monitoring
         original_cwd = os.getcwd()
         os.chdir(str(ai_toolkit_dir))
+        
         last_progress_update = time.time()
         progress_update_interval = 30  # Send update every 30 seconds
         last_progress_info = None
         sample_count = 0
+        
         try:
             process = subprocess.Popen(
                 cmd,
@@ -469,19 +463,24 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                 bufsize=1,
                 universal_newlines=True
             )
+            
             logger.info("Training process started")
+            
             while True:
                 output = process.stdout.readline()
                 if output == '' and process.poll() is not None:
                     break
+                
                 if output:
                     line = output.rstrip()
                     print(line, flush=True)
+                    
                     # Check for sample image generation
                     sample_image_path = detect_sample_image(line, output_dir)
                     if sample_image_path:
                         sample_count += 1
                         current_step = last_progress_info["current_step_number"] if last_progress_info else 0
+                        
                         await publish_event('training.testimage', job_id, {
                             'image_url': sample_image_path,
                             'step_number': current_step,
@@ -492,14 +491,17 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                             }
                         })
                         logger.info(f"Published test image event: {sample_image_path}")
+                    
                     # Parse progress from each line
                     current_time = time.time()
                     progress_info = parse_progress_from_log(line, start_time)
+                    
                     # Send update if interval elapsed and we have meaningful progress
                     if current_time - last_progress_update >= progress_update_interval:
                         if progress_info["progress"] > 0 or progress_info["loss"] is not None:
                             # Calculate actual progress (20% base + 75% of training)
                             actual_progress = min(95, 20 + int(progress_info["progress"] * 0.75))
+                            
                             event_data = {
                                 'status': 'training',
                                 'progress': actual_progress,
@@ -512,23 +514,31 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                                     'learning_rate': progress_info["learning_rate"]
                                 }
                             }
+                            
                             await publish_event('training.progress', job_id, event_data)
                             last_progress_update = current_time
                             last_progress_info = progress_info
+            
             # Get remaining output
             remaining_output = process.stdout.read()
             if remaining_output:
                 print(remaining_output, flush=True)
+            
             return_code = process.poll()
+            
             if return_code == 0:
                 logger.info("Training completed successfully")
+                
                 # List output files
                 output_files = list(output_dir.rglob('*'))
                 model_files = [str(f.relative_to(NETWORK_VOLUME_PATH)) 
                              for f in output_files if f.is_file()]
+                
                 # Calculate total size
                 total_size_bytes = sum(f.stat().st_size for f in output_files if f.is_file())
+                
                 logger.info(f"Generated {len(model_files)} output files ({total_size_bytes / 1024 / 1024:.1f}MB)")
+                
                 # Publish completion event
                 await publish_event('training.completed', job_id, {
                     'status': 'completed',
