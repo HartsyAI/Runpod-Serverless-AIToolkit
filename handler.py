@@ -157,28 +157,34 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
     
     message_type = message_type_map.get(event_type, 'TrainingProgressMessage')
     
-    # Build payload with all message fields (C# expects PascalCase)
+    # Build payload with all message fields (C# uses PascalCase properties but camelCase JSON)
     payload = {
-        'JobId': str(job_id),
-        'BackendId': BACKEND_ID,
-        'EventType': event_type,
-        'Timestamp': datetime.utcnow().isoformat() + 'Z',
-        **{to_pascal_case(k): v for k, v in data.items() if k != 'metadata'}
+        'jobId': str(job_id),
+        'backendId': BACKEND_ID,
+        'eventType': event_type,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
     }
+    
+    # Add all data fields with proper casing
+    for key, value in data.items():
+        if key != 'metadata' and value is not None:
+            # Convert snake_case to camelCase
+            camel_key = to_camel_case(key)
+            payload[camel_key] = value
     
     # Add metadata if present
     if 'metadata' in data and data['metadata']:
-        payload['Metadata'] = data['metadata']
+        payload['metadata'] = data['metadata']
     
-    # Build GenericMessageEnvelope structure
+    # Build GenericMessageEnvelope structure (camelCase for JSON)
     message_body = {
-        'MessageId': f"{job_id}_{int(time.time())}_{event_type}",
-        'MessageType': message_type,
-        'SourceSite': BACKEND_ID,
-        'TargetSites': 'Hartsy',
-        'Timestamp': datetime.utcnow().isoformat() + 'Z',
-        'Version': 1,
-        'Payload': payload
+        'messageId': f"{job_id}_{int(time.time())}_{event_type}",
+        'messageType': message_type,
+        'sourceSite': BACKEND_ID,
+        'targetSites': 'Hartsy',
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'version': 1,
+        'payload': payload
     }
     
     for attempt in range(max_retries):
