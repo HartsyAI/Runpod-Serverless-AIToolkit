@@ -198,7 +198,7 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
                 body=json.dumps(message_body).encode('utf-8'),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 content_type='application/json',
-                message_id=message_body['MessageId'],
+                message_id=message_body['messageId'],  # Changed to camelCase
                 timestamp=datetime.utcnow()
             )
             
