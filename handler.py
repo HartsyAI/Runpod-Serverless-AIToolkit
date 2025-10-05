@@ -135,7 +135,7 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
     Args:
         event_type: Event type (training.started, training.progress, etc.)
         job_id: Internal job ID from Hartsy database
-        data: Event payload - will be merged with base message fields
+        data: Event payload - message-specific fields
         max_retries: Maximum retry attempts
         
     Returns:
@@ -145,13 +145,40 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
         logger.warning("RabbitMQ not configured, skipping event publish")
         return False
     
-    # Build message body with base fields + data payload
+    # Map event type to C# message class name
+    message_type_map = {
+        'training.started': 'TrainingStartedMessage',
+        'training.progress': 'TrainingProgressMessage',
+        'training.completed': 'TrainingCompletedMessage',
+        'training.failed': 'TrainingFailedMessage',
+        'training.testimage': 'TrainingTestImageMessage',
+        'training.modelready': 'TrainingModelReadyMessage'
+    }
+    
+    message_type = message_type_map.get(event_type, 'TrainingProgressMessage')
+    
+    # Build payload with all message fields (C# expects PascalCase)
+    payload = {
+        'JobId': str(job_id),
+        'BackendId': BACKEND_ID,
+        'EventType': event_type,
+        'Timestamp': datetime.utcnow().isoformat() + 'Z',
+        **{to_pascal_case(k): v for k, v in data.items() if k != 'metadata'}
+    }
+    
+    # Add metadata if present
+    if 'metadata' in data and data['metadata']:
+        payload['Metadata'] = data['metadata']
+    
+    # Build GenericMessageEnvelope structure
     message_body = {
-        'job_id': job_id,
-        'backend_id': BACKEND_ID,
-        'event_type': event_type,
-        'timestamp': datetime.utcnow().isoformat(),
-        **data  # Merge data fields at top level
+        'MessageId': f"{job_id}_{int(time.time())}_{event_type}",
+        'MessageType': message_type,
+        'SourceSite': BACKEND_ID,
+        'TargetSites': 'Hartsy',
+        'Timestamp': datetime.utcnow().isoformat() + 'Z',
+        'Version': 1,
+        'Payload': payload
     }
     
     for attempt in range(max_retries):
@@ -165,7 +192,7 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
                 body=json.dumps(message_body).encode('utf-8'),
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 content_type='application/json',
-                message_id=f"{job_id}_{int(time.time())}",
+                message_id=message_body['MessageId'],
                 timestamp=datetime.utcnow()
             )
             
@@ -200,6 +227,11 @@ async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_
             await asyncio.sleep(1)
     
     return False
+
+def to_pascal_case(snake_str: str) -> str:
+    """Converts snake_case to PascalCase for C# compatibility."""
+    components = snake_str.split('_')
+    return ''.join(x.title() for x in components)
 
 def extract_model_name_from_config(config_content: str) -> str:
     """Extracts model name from YAML configuration."""
@@ -555,6 +587,7 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                         'total_samples_generated': sample_count
                     }
                 })
+                
                 return {
                     "success": True,
                     "message": "Training completed successfully",
@@ -567,6 +600,7 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                 }
             else:
                 logger.error(f"Training failed with return code: {return_code}")
+                
                 await publish_event('training.failed', job_id, {
                     'status': 'failed',
                     'error': f"Training process exited with code {return_code}",
@@ -576,17 +610,20 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                         'return_code': return_code
                     }
                 })
+                
                 return {
                     "success": False,
                     "error": f"Training process failed with return code {return_code}",
                     "session_id": session_id,
                     "job_id": job_id
                 }
+        
         finally:
             os.chdir(original_cwd)
     
     except Exception as ex:
         logger.error(f"Training error: {str(ex)}", exc_info=True)
+        
         await publish_event('training.failed', job_id, {
             'status': 'failed',
             'error': str(ex),
@@ -595,11 +632,13 @@ async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
                 'error_type': type(ex).__name__
             }
         })
+        
         return {
             "success": False,
             "error": str(ex),
             "job_id": job_id
         }
+    
     finally:
         # Cleanup RabbitMQ connection
         await RabbitMQConnectionManager.cleanup()
@@ -611,9 +650,12 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Backend ID: {BACKEND_ID}")
         logger.info(f"Network volume: {NETWORK_VOLUME_PATH}")
         logger.info(f"RabbitMQ configured: {bool(RABBITMQ_URL)}")
+        
         result = await run_training(event)
+        
         logger.info("=== RunPod AI Training Handler Completed ===")
         return result
+        
     except Exception as ex:
         logger.error(f"Handler error: {str(ex)}", exc_info=True)
         return {"success": False, "error": str(ex)}
