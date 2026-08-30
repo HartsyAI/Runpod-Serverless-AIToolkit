@@ -9,6 +9,24 @@ docker build --pull --build-arg AI_TOOLKIT_REVISION=be995185f598c83abb990a088e9f
 docker push your-registry/hartsy-ai-toolkit:be995185
 ```
 
+## Automatic Docker Hub publishing
+
+The `Build and publish worker image` GitHub Actions workflow tests and builds every pull request. A push to `main`, or a manual workflow dispatch, publishes the Linux AMD64 image to:
+
+```text
+docker.io/kalebbroo/runpod-serverless-aitoolkit:latest
+docker.io/kalebbroo/runpod-serverless-aitoolkit:sha-<full-git-commit>
+```
+
+Configure these GitHub Actions repository secrets before merging the workflow:
+
+- `DOCKERHUB_USERNAME`: `kalebbroo`
+- `DOCKERHUB_TOKEN`: a Docker Hub personal access token with Read & Write permission
+
+Create the `kalebbroo/runpod-serverless-aitoolkit` Docker Hub repository first. Do not store a Docker Hub password or token in the repository. Use the immutable `sha-<full-git-commit>` tag in the RunPod template; `latest` is a convenience tag for inspection and manual testing.
+
+The workflow publishes BuildKit provenance and an SBOM with release images and uses the GitHub Actions cache for subsequent builds.
+
 Create a queue-based RunPod Serverless endpoint from that immutable image. Use one concurrent request per worker because `/dataset` and `/workspace/output` are intentionally reset for every request. Allocate enough container disk for the model cache plus dataset/output and choose a GPU configuration appropriate for the largest model families you enable. Hartsy sends a 24-hour execution policy and seven-day status TTL by default; the endpoint must permit those limits.
 
 Required worker environment:
