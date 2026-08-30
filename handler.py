@@ -29,15 +29,19 @@ TOOLKIT_ROOT = Path(os.getenv("AI_TOOLKIT_ROOT", "/app/ai-toolkit")).resolve()
 WORK_ROOT = Path(os.getenv("AITK_WORK_ROOT", "/workspace")).resolve()
 DATASET_ROOT = Path("/dataset").resolve()
 OUTPUT_ROOT = (WORK_ROOT / "output").resolve()
-MAX_ARCHIVE_BYTES = int(os.getenv("AITK_MAX_ARCHIVE_BYTES", str(4 * 1024**3)))
-MAX_EXTRACTED_BYTES = int(os.getenv("AITK_MAX_EXTRACTED_BYTES", str(8 * 1024**3)))
+MAX_ARCHIVE_BYTES = max(1, int(os.getenv("AITK_MAX_ARCHIVE_BYTES", str(4 * 1024**3))))
+MAX_EXTRACTED_BYTES = max(1, int(os.getenv("AITK_MAX_EXTRACTED_BYTES", str(8 * 1024**3))))
+MAX_DATASET_ARCHIVES = max(1, int(os.getenv("AITK_MAX_DATASET_ARCHIVES", "8")))
 SAMPLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mp3", ".wav", ".flac", ".ogg"}
 ARTIFACT_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".json", ".yaml", ".yml"}
 STEP_PATTERN = re.compile(r"(?:^|[_-])(?:step)?[_-]?(\d+)(?:[_-]|\.)", re.IGNORECASE)
 SAFE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_DATASET_REDIRECTS = 5
 
 
 def require_text(payload: dict[str, Any], key: str) -> str:
+    """Return a required, non-empty string from a RunPod input payload."""
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"input.{key} is required")
@@ -45,6 +49,7 @@ def require_text(payload: dict[str, Any], key: str) -> str:
 
 
 def require_identifier(payload: dict[str, Any], key: str) -> str:
+    """Return a path-safe identifier from a RunPod input payload."""
     value = require_text(payload, key)
     if not SAFE_IDENTIFIER_PATTERN.fullmatch(value):
         raise ValueError(f"input.{key} contains unsupported characters")
@@ -52,6 +57,7 @@ def require_identifier(payload: dict[str, Any], key: str) -> str:
 
 
 def validate_installed_revision() -> None:
+    """Ensure the container and web application use the same AI Toolkit commit."""
     actual_revision = os.getenv("AI_TOOLKIT_REVISION", "").strip()
     if not actual_revision and (TOOLKIT_ROOT / ".git").exists():
         result = subprocess.run(
@@ -69,6 +75,7 @@ def validate_installed_revision() -> None:
 
 
 def validate_process_paths(process: dict[str, Any]) -> None:
+    """Keep generated training and dataset paths inside worker-owned roots."""
     training_folder = Path(str(process.get("training_folder", ""))).resolve()
     if training_folder != OUTPUT_ROOT:
         raise ValueError(f"config.process[0].training_folder must be {OUTPUT_ROOT}")
@@ -87,21 +94,80 @@ def validate_process_paths(process: dict[str, Any]) -> None:
 
 
 def reset_directory(path: Path) -> None:
+    """Create an empty request-scoped directory."""
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
 
-def download_archive(url: str, destination: Path) -> None:
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https":
-        raise ValueError("Dataset archives must use HTTPS")
-    with requests.get(url, stream=True, timeout=(20, 300), allow_redirects=True) as response:
-        response.raise_for_status()
-        if urllib.parse.urlparse(response.url).scheme != "https":
-            raise ValueError("Dataset archive redirected away from HTTPS")
+def require_https_url(url: str, label: str) -> str:
+    """Validate an absolute HTTPS URL without embedded credentials."""
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError(f"{label} is not a valid URL") from error
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{label} must be an absolute HTTPS URL without credentials")
+    return url
+
+
+def url_origin(url: str, label: str) -> str:
+    """Return the normalized HTTPS origin for an already validated URL."""
+    parsed = urllib.parse.urlsplit(require_https_url(url, label))
+    host = parsed.hostname.lower()
+    authority = f"[{host}]" if ":" in host else host
+    if parsed.port and parsed.port != 443:
+        authority = f"{authority}:{parsed.port}"
+    return f"https://{authority}"
+
+
+def dataset_allowed_origins() -> set[str]:
+    """Load the exact object-storage origins permitted for dataset downloads."""
+    configured = os.getenv("AITK_DATASET_ALLOWED_ORIGINS", "")
+    if not configured.strip():
+        raise RuntimeError("AITK_DATASET_ALLOWED_ORIGINS must contain at least one HTTPS origin")
+    origins = set()
+    for value in configured.split(","):
+        candidate = value.strip()
+        parsed = urllib.parse.urlsplit(require_https_url(candidate, "Dataset allowlist origin"))
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Dataset allowlist entries must be origins without paths, queries, or fragments")
+        origins.add(url_origin(candidate, "Dataset allowlist origin"))
+    return origins
+
+
+def open_dataset_response(url: str):
+    """Open an allowlisted dataset URL while validating every redirect target."""
+    allowed_origins = dataset_allowed_origins()
+    current_url = url
+    for redirect_count in range(MAX_DATASET_REDIRECTS + 1):
+        if url_origin(current_url, "Dataset archive URL") not in allowed_origins:
+            raise ValueError("Dataset archive URL origin is not allowlisted")
+        response = requests.get(current_url, stream=True, timeout=(20, 300), allow_redirects=False)
+        if response.status_code in REDIRECT_STATUSES:
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise ValueError("Dataset archive redirect is missing a location")
+            if redirect_count == MAX_DATASET_REDIRECTS:
+                raise ValueError("Dataset archive exceeded the redirect limit")
+            current_url = urllib.parse.urljoin(current_url, location)
+            continue
+        try:
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
+        return response
+    raise ValueError("Dataset archive exceeded the redirect limit")
+
+
+def download_archive(url: str, destination: Path, max_bytes: int = MAX_ARCHIVE_BYTES) -> int:
+    """Download an allowlisted dataset archive with a compressed-size limit."""
+    with open_dataset_response(url) as response:
         declared_size = int(response.headers.get("content-length", "0") or 0)
-        if declared_size > MAX_ARCHIVE_BYTES:
+        if declared_size > max_bytes:
             raise ValueError("Dataset archive is too large")
         downloaded = 0
         with destination.open("wb") as archive:
@@ -109,12 +175,14 @@ def download_archive(url: str, destination: Path) -> None:
                 if not chunk:
                     continue
                 downloaded += len(chunk)
-                if downloaded > MAX_ARCHIVE_BYTES:
+                if downloaded > max_bytes:
                     raise ValueError("Dataset archive is too large")
                 archive.write(chunk)
+    return downloaded
 
 
-def extract_archive(archive_path: Path, destination: Path) -> None:
+def extract_archive(archive_path: Path, destination: Path, max_bytes: int = MAX_EXTRACTED_BYTES) -> int:
+    """Extract a ZIP while rejecting traversal, links, duplicates, and zip bombs."""
     with zipfile.ZipFile(archive_path) as archive:
         extracted_size = 0
         for member in archive.infolist():
@@ -122,7 +190,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
             if stat.S_ISLNK(member_mode):
                 raise ValueError("Dataset archives cannot contain symbolic links")
             extracted_size += member.file_size
-            if extracted_size > MAX_EXTRACTED_BYTES:
+            if extracted_size > max_bytes:
                 raise ValueError("Extracted dataset is too large")
             target = (destination / member.filename).resolve()
             if target != destination and destination not in target.parents:
@@ -135,16 +203,21 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
                 raise ValueError(f"Dataset archives contain duplicate path: {member.filename}")
             with archive.open(member) as source, target.open("xb") as output:
                 shutil.copyfileobj(source, output, length=1024 * 1024)
+    return extracted_size
 
 
 def storage_client():
+    """Create an S3 client whose optional custom endpoint is HTTPS-only."""
     required = ["AITK_S3_BUCKET", "AITK_S3_ACCESS_KEY", "AITK_S3_SECRET_KEY"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise RuntimeError(f"Worker storage is missing: {', '.join(missing)}")
+    endpoint = os.getenv("AITK_S3_ENDPOINT", "").strip()
+    if endpoint:
+        endpoint = require_https_url(endpoint, "AITK_S3_ENDPOINT")
     return boto3.client(
         "s3",
-        endpoint_url=os.getenv("AITK_S3_ENDPOINT") or None,
+        endpoint_url=endpoint or None,
         region_name=os.getenv("AITK_S3_REGION", "us-east-1"),
         aws_access_key_id=os.environ["AITK_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["AITK_S3_SECRET_KEY"],
@@ -152,17 +225,21 @@ def storage_client():
 
 
 def object_url(client, bucket: str, key: str) -> str:
+    """Return an HTTPS public or presigned URL for an uploaded object."""
     public_base = os.getenv("AITK_S3_PUBLIC_BASE_URL", "").rstrip("/")
     if public_base:
-        return f"{public_base}/{urllib.parse.quote(key, safe='/')}"
-    return client.generate_presigned_url(
+        require_https_url(public_base, "AITK_S3_PUBLIC_BASE_URL")
+        return require_https_url(f"{public_base}/{urllib.parse.quote(key, safe='/')}", "Storage object URL")
+    generated = client.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=min(int(os.getenv("AITK_URL_TTL_SECONDS", "604800")), 604800),
     )
+    return require_https_url(generated, "Presigned storage object URL")
 
 
 def upload_file(client, session_id: str, path: Path, relative_name: str) -> dict[str, Any]:
+    """Upload one worker output and return its provider-neutral manifest entry."""
     bucket = os.environ["AITK_S3_BUCKET"]
     safe_name = "/".join(part for part in Path(relative_name).parts if part not in {"", ".", ".."})
     key = f"training/{session_id}/{safe_name}"
@@ -178,6 +255,7 @@ def upload_file(client, session_id: str, path: Path, relative_name: str) -> dict
 
 
 def latest_loss(loss_db: Path) -> tuple[int | None, float | None]:
+    """Read the latest loss value from AI Toolkit's official UI logger database."""
     if not loss_db.exists():
         return None, None
     try:
@@ -206,6 +284,7 @@ def discover_samples(
     uploaded: dict[Path, dict[str, Any]],
     minimum_age_seconds: float = 2,
 ) -> list[dict[str, Any]]:
+    """Upload newly completed image, video, or audio training samples."""
     if sample_root.exists():
         for path in sorted(sample_root.iterdir()):
             if not path.is_file() or path.is_symlink() or path.suffix.lower() not in SAMPLE_EXTENSIONS or path.name.startswith("."):
@@ -226,6 +305,7 @@ def discover_samples(
 
 
 def drain_output(stream, tail: list[str]) -> None:
+    """Drain child-process output while retaining a bounded activity tail."""
     for line in iter(stream.readline, ""):
         clean = line.rstrip()
         if clean:
@@ -235,6 +315,7 @@ def drain_output(stream, tail: list[str]) -> None:
 
 
 def artifact_kind(path: Path) -> str:
+    """Classify a generated file for Hartsy's artifact manifest."""
     content_type = mimetypes.guess_type(path.name)[0] or ""
     if path.suffix.lower() in {".yaml", ".yml", ".json"}:
         return "config"
@@ -248,6 +329,7 @@ def artifact_kind(path: Path) -> str:
 
 
 def upload_artifacts(client, session_id: str, output_dir: Path) -> list[dict[str, Any]]:
+    """Upload supported final artifacts and select the primary weights file."""
     candidates = [
         path
         for path in output_dir.rglob("*")
@@ -274,6 +356,7 @@ def upload_artifacts(client, session_id: str, output_dir: Path) -> list[dict[str
 
 
 def handler(job: dict[str, Any]) -> dict[str, Any]:
+    """Execute one versioned AI Toolkit training request for RunPod Serverless."""
     payload = job.get("input") or {}
     if payload.get("contract_version") != CONTRACT_VERSION:
         raise ValueError(f"Unsupported contract_version; expected {CONTRACT_VERSION}")
@@ -305,11 +388,21 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     archives = payload.get("dataset_urls") or []
     if not isinstance(archives, list) or not archives:
         raise ValueError("input.dataset_urls must contain at least one archive")
+    if len(archives) > MAX_DATASET_ARCHIVES:
+        raise ValueError(f"input.dataset_urls cannot contain more than {MAX_DATASET_ARCHIVES} archives")
+    remaining_archive_bytes = MAX_ARCHIVE_BYTES
+    remaining_extracted_bytes = MAX_EXTRACTED_BYTES
     for index, url in enumerate(archives):
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(f"input.dataset_urls[{index}] must be a non-empty URL")
         archive_path = WORK_ROOT / f"dataset-{index}.zip"
-        download_archive(str(url), archive_path)
-        extract_archive(archive_path, DATASET_ROOT)
-        archive_path.unlink(missing_ok=True)
+        try:
+            downloaded = download_archive(url.strip(), archive_path, remaining_archive_bytes)
+            remaining_archive_bytes -= downloaded
+            extracted = extract_archive(archive_path, DATASET_ROOT, remaining_extracted_bytes)
+            remaining_extracted_bytes -= extracted
+        finally:
+            archive_path.unlink(missing_ok=True)
 
     config_path = WORK_ROOT / f"{session_id}.yaml"
     config_path.write_text(config_yaml, encoding="utf-8")
@@ -396,6 +489,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 process_handle.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 process_handle.kill()
+                process_handle.wait()
+        reader.join(timeout=5)
 
 
 if __name__ == "__main__":
