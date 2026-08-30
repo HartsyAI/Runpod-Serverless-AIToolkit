@@ -18,12 +18,13 @@ docker.io/kalebbroo/runpod-serverless-aitoolkit:latest
 docker.io/kalebbroo/runpod-serverless-aitoolkit:sha-<full-git-commit>
 ```
 
-Configure these GitHub Actions repository secrets before merging the workflow:
+Configure this GitHub Actions repository secret before publishing:
 
-- `DOCKERHUB_USERNAME`: `kalebbroo`
 - `DOCKERHUB_TOKEN`: a Docker Hub personal access token with Read & Write permission
 
-Create the `kalebbroo/runpod-serverless-aitoolkit` Docker Hub repository first. Do not store a Docker Hub password or token in the repository. Use the immutable `sha-<full-git-commit>` tag in the RunPod template; `latest` is a convenience tag for inspection and manual testing.
+The public Docker Hub username `kalebbroo` is configured directly in the workflow and does not need to be stored as a secret.
+
+The first successful push creates `kalebbroo/runpod-serverless-aitoolkit` if it does not exist. Do not store a Docker Hub password or token in the repository. Use the immutable `sha-<full-git-commit>` tag in the RunPod template; `latest` is a convenience tag for inspection and manual testing.
 
 The workflow publishes BuildKit provenance and an SBOM with release images and uses the GitHub Actions cache for subsequent builds.
 
