@@ -1,680 +1,497 @@
-"""
-RunPod Serverless AI Training Handler For AI Toolkit - By Hartsy
+"""RunPod Serverless contract for Hartsy's version-pinned AI Toolkit backend."""
 
-Production-ready handler with async RabbitMQ messaging, persistent connections,
-and comprehensive progress tracking. Files stored on network volume.
-
-Features:
-- Async RabbitMQ messaging with aio-pika
-- Persistent connection pooling
-- Detailed progress updates with step/epoch/loss tracking
-- Network volume storage for trained models
-- Robust error handling and retries
-- Publisher confirms for guaranteed delivery
-- Sample image detection and broadcasting
-
-Author: Kalebbroo - Hartsy
-License: MIT
-Version: 3.2
-"""
+from __future__ import annotations
 
 import json
+import mimetypes
 import os
-import subprocess
-import logging
-import yaml
-import time
-import sys
-import asyncio
-import aiohttp
-import zipfile
-import io
-import aio_pika
-from pathlib import Path
-from typing import Dict, Any, Optional
-import runpod
 import re
-from datetime import datetime
+import shutil
+import sqlite3
+import stat
+import subprocess
+import threading
+import time
+import urllib.parse
+import zipfile
+from pathlib import Path
+from typing import Any
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+import boto3
+import requests
+import runpod
+import yaml
 
-# Configuration
-NETWORK_VOLUME_PATH = Path(os.environ.get('NETWORK_VOLUME_PATH', '/runpod-volume'))
-RABBITMQ_URL = os.environ.get('RABBITMQ_URL', '')
-RABBITMQ_EXCHANGE = os.environ.get('RABBITMQ_EXCHANGE', 'training.events')
-BACKEND_ID = os.environ.get('BACKEND_ID', 'ai-toolkit')  # Static backend identifier
 
-class RabbitMQConnectionManager:
-    """Manages persistent RabbitMQ connection with automatic reconnection."""
-    
-    _connection: Optional[aio_pika.Connection] = None
-    _channel: Optional[aio_pika.Channel] = None
-    _exchange: Optional[aio_pika.Exchange] = None
-    _lock = asyncio.Lock()
-    _is_initialized = False
+CONTRACT_VERSION = 2
+EXPECTED_REVISION = "be995185f598c83abb990a088e9f634c4d36eb46"
+TOOLKIT_ROOT = Path(os.getenv("AI_TOOLKIT_ROOT", "/app/ai-toolkit")).resolve()
+WORK_ROOT = Path(os.getenv("AITK_WORK_ROOT", "/workspace")).resolve()
+DATASET_ROOT = Path("/dataset").resolve()
+OUTPUT_ROOT = (WORK_ROOT / "output").resolve()
+MAX_ARCHIVE_BYTES = max(1, int(os.getenv("AITK_MAX_ARCHIVE_BYTES", str(4 * 1024**3))))
+MAX_EXTRACTED_BYTES = max(1, int(os.getenv("AITK_MAX_EXTRACTED_BYTES", str(8 * 1024**3))))
+MAX_DATASET_ARCHIVES = max(1, int(os.getenv("AITK_MAX_DATASET_ARCHIVES", "8")))
+SAMPLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mp3", ".wav", ".flac", ".ogg"}
+ARTIFACT_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".json", ".yaml", ".yml"}
+STEP_PATTERN = re.compile(r"(?:^|[_-])(?:step)?[_-]?(\d+)(?:[_-]|\.)", re.IGNORECASE)
+SAFE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_DATASET_REDIRECTS = 5
 
-    @classmethod
-    async def initialize(cls):
-        """Initialize connection manager with RabbitMQ."""
-        if not RABBITMQ_URL:
-            logger.warning("RabbitMQ URL not configured")
-            return False
-        
-        async with cls._lock:
-            if not cls._is_initialized:
-                try:
-                    cls._connection = await aio_pika.connect_robust(
-                        RABBITMQ_URL,
-                        heartbeat=60,
-                        connection_attempts=3,
-                        retry_delay=5
-                    )
-                    cls._is_initialized = True
-                    logger.info("RabbitMQ connection manager initialized")
-                    return True
-                except Exception as ex:
-                    logger.error(f"Failed to initialize RabbitMQ: {ex}")
-                    return False
-        return True
 
-    @classmethod
-    async def get_channel(cls) -> Optional[aio_pika.Channel]:
-        """Get or create RabbitMQ channel with exchange declared."""
-        if not cls._is_initialized:
-            await cls.initialize()
-        
-        if not cls._connection or cls._connection.is_closed:
-            await cls.initialize()
-        
-        async with cls._lock:
-            if cls._channel is None or cls._channel.is_closed:
-                cls._channel = await cls._connection.channel()
-                # Declare exchange (publishers only need the exchange)
-                cls._exchange = await cls._channel.declare_exchange(
-                    RABBITMQ_EXCHANGE,
-                    aio_pika.ExchangeType.TOPIC,
-                    durable=True
-                )
-                logger.info(f"RabbitMQ channel and exchange '{RABBITMQ_EXCHANGE}' ready")
-                # Enable publisher confirms for guaranteed delivery
-                await cls._channel.set_qos(prefetch_count=1)
-        return cls._channel
+def require_text(payload: dict[str, Any], key: str) -> str:
+    """Return a required, non-empty string from a RunPod input payload."""
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"input.{key} is required")
+    return value.strip()
 
-    @classmethod
-    async def get_exchange(cls) -> Optional[aio_pika.Exchange]:
-        """Get exchange, ensuring channel is ready."""
-        await cls.get_channel()
-        return cls._exchange
 
-    @classmethod
-    async def cleanup(cls):
-        """Clean up connections on shutdown."""
-        async with cls._lock:
-            if cls._channel and not cls._channel.is_closed:
-                await cls._channel.close()
-                logger.debug("Channel closed")
-            
-            if cls._connection and not cls._connection.is_closed:
-                await cls._connection.close()
-                logger.info("RabbitMQ connection closed")
-            
-            cls._channel = None
-            cls._exchange = None
-            cls._connection = None
-            cls._is_initialized = False
+def require_identifier(payload: dict[str, Any], key: str) -> str:
+    """Return a path-safe identifier from a RunPod input payload."""
+    value = require_text(payload, key)
+    if not SAFE_IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(f"input.{key} contains unsupported characters")
+    return value
 
-async def publish_event(event_type: str, job_id: str, data: Dict[str, Any], max_retries: int = 3) -> bool:
-    """Publishes training event to RabbitMQ with delivery confirmation.
-    
-    Args:
-        event_type: Event type (training.started, training.progress, etc.)
-        job_id: Internal job ID from Hartsy database
-        data: Event payload - message-specific fields
-        max_retries: Maximum retry attempts
-        
-    Returns:
-        bool: True if published successfully
-    """
-    if not RABBITMQ_URL:
-        logger.warning("RabbitMQ not configured, skipping event publish")
-        return False
-    
-    # Map event type to C# message class name
-    message_type_map = {
-        'training.started': 'TrainingStartedMessage',
-        'training.progress': 'TrainingProgressMessage',
-        'training.completed': 'TrainingCompletedMessage',
-        'training.failed': 'TrainingFailedMessage',
-        'training.testimage': 'TrainingTestImageMessage',
-        'training.modelready': 'TrainingModelReadyMessage'
-    }
-    
-    message_type = message_type_map.get(event_type, 'TrainingProgressMessage')
-    
-    # Build payload with all message fields (C# uses PascalCase properties but camelCase JSON)
-    payload = {
-        'jobId': str(job_id),
-        'backendId': BACKEND_ID,
-        'eventType': event_type,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
-    }
-    
-    # Add all data fields with proper casing
-    for key, value in data.items():
-        if key != 'metadata' and value is not None:
-            # Convert snake_case to camelCase
-            camel_key = to_camel_case(key)
-            payload[camel_key] = value
-    
-    # Add metadata if present
-    if 'metadata' in data and data['metadata']:
-        payload['metadata'] = data['metadata']
-    
-    # Build GenericMessageEnvelope structure (camelCase for JSON)
-    message_body = {
-        'messageId': f"{job_id}_{int(time.time())}_{event_type}",
-        'messageType': message_type,
-        'sourceSite': BACKEND_ID,
-        'targetSites': 'Hartsy',
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'version': 1,
-        'payload': payload
-    }
-    
-    for attempt in range(max_retries):
-        try:
-            exchange = await RabbitMQConnectionManager.get_exchange()
-            if not exchange:
-                raise Exception("Failed to get RabbitMQ exchange")
-            
-            # Create message with persistence
-            message = aio_pika.Message(
-                body=json.dumps(message_body).encode('utf-8'),
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                content_type='application/json',
-                message_id=message_body['messageId'],  # Changed to camelCase
-                timestamp=datetime.utcnow()
-            )
-            
-            # Publish with confirmation
-            await exchange.publish(
-                message,
-                routing_key=event_type,
-                timeout=15.0  # 15 second timeout for confirmation
-            )
-            
-            logger.info(f"Published event: {event_type} for job {job_id}")
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.warning(f"Publish timeout (attempt {attempt + 1}/{max_retries})")
-            if attempt == max_retries - 1:
-                logger.error(f"Failed to publish after {max_retries} timeout attempts")
-                return False
-            await asyncio.sleep(min(2 ** attempt, 10))
-            
-        except aio_pika.exceptions.AMQPError as ex:
-            logger.error(f"AMQP error (attempt {attempt + 1}/{max_retries}): {ex}")
-            if attempt == max_retries - 1:
-                logger.error(f"Failed to publish after {max_retries} AMQP errors")
-                return False
-            await asyncio.sleep(min(2 ** attempt, 10))
-            
-        except Exception as ex:
-            logger.error(f"Unexpected publish error: {ex}", exc_info=True)
-            if attempt == max_retries - 1:
-                return False
-            await asyncio.sleep(1)
-    
-    return False
 
-def to_camel_case(snake_str: str) -> str:
-    """Converts snake_case to camelCase for C# JSON compatibility."""
-    components = snake_str.split('_')
-    # First component stays lowercase, rest are capitalized
-    return components[0] + ''.join(x.title() for x in components[1:])
-
-def to_camel_case(snake_str: str) -> str:
-    """Converts snake_case to camelCase for C# JSON compatibility."""
-    components = snake_str.split('_')
-    # First component stays lowercase, rest are capitalized
-    return components[0] + ''.join(x.title() for x in components[1:])
-
-def extract_model_name_from_config(config_content: str) -> str:
-    """Extracts model name from YAML configuration."""
-    try:
-        config_data = yaml.safe_load(config_content)
-        model_name = (
-            config_data.get('config', {}).get('name') or
-            config_data.get('name') or
-            config_data.get('model_name') or
-            'default_model'
+def validate_installed_revision() -> None:
+    """Ensure the container and web application use the same AI Toolkit commit."""
+    actual_revision = os.getenv("AI_TOOLKIT_REVISION", "").strip()
+    if not actual_revision and (TOOLKIT_ROOT / ".git").exists():
+        result = subprocess.run(
+            ["git", "-C", str(TOOLKIT_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        logger.info(f"Extracted model name: {model_name}")
-        return model_name
-    except Exception as ex:
-        logger.warning(f"Could not extract model name: {ex}")
-        return 'default_model'
+        actual_revision = result.stdout.strip()
+    if actual_revision != EXPECTED_REVISION:
+        raise RuntimeError(
+            f"Installed AI Toolkit revision {actual_revision or 'unknown'} does not match {EXPECTED_REVISION}"
+        )
 
-def parse_progress_from_log(log_line: str, start_time: float, total_steps_estimate: int = 1000) -> Dict[str, Any]:
-    """Parses comprehensive training progress from AI Toolkit log output.
-    
-    Enhanced to extract:
-    - Step progress (current/total)
-    - Loss values
-    - Learning rate
-    - ETA calculations
-    
-    Args:
-        log_line: Single line from training output
-        start_time: Training start timestamp
-        total_steps_estimate: Estimated total steps (for early progress)
-        
-    Returns:
-        Dict with detailed progress information
-    """
-    progress_info = {
-        "progress": 0,
-        "current_step": "Training",
-        "estimated_minutes_remaining": None,
-        "loss": None,
-        "learning_rate": None,
-        "current_step_number": None,
-        "total_steps": None
-    }
-    
+
+def validate_process_paths(process: dict[str, Any]) -> None:
+    """Keep generated training and dataset paths inside worker-owned roots."""
+    training_folder = Path(str(process.get("training_folder", ""))).resolve()
+    if training_folder != OUTPUT_ROOT:
+        raise ValueError(f"config.process[0].training_folder must be {OUTPUT_ROOT}")
+    datasets = process.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        raise ValueError("config.process[0].datasets must contain at least one dataset")
+    for dataset_index, dataset in enumerate(datasets):
+        if not isinstance(dataset, dict):
+            raise ValueError(f"config.process[0].datasets[{dataset_index}] must be an object")
+        for key, value in dataset.items():
+            if value is None or not (key.endswith("_path") or re.search(r"_path_\d+$", key)):
+                continue
+            path = Path(str(value)).resolve()
+            if path != DATASET_ROOT and DATASET_ROOT not in path.parents:
+                raise ValueError(f"config.process[0].datasets[{dataset_index}].{key} must stay inside {DATASET_ROOT}")
+
+
+def reset_directory(path: Path) -> None:
+    """Create an empty request-scoped directory."""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def require_https_url(url: str, label: str) -> str:
+    """Validate an absolute HTTPS URL without embedded credentials."""
+    parsed = urllib.parse.urlsplit(url)
     try:
-        # Step progress: "614/1000 [22:47<13:31, 2.10s/it, lr: 1.0e-06 loss: 3.866e-01]"
-        step_match = re.search(r'(\d+)/(\d+)\s*\[', log_line)
-        if step_match:
-            current = int(step_match.group(1))
-            total = int(step_match.group(2))
-            
-            progress_info["current_step_number"] = current
-            progress_info["total_steps"] = total
-            progress_info["progress"] = int((current / total) * 100)
-            
-            # Extract loss if present
-            loss_match = re.search(r'loss:\s*([0-9.e-]+)', log_line)
-            if loss_match:
-                progress_info["loss"] = float(loss_match.group(1))
-            
-            # Extract learning rate if present
-            lr_match = re.search(r'lr:\s*([0-9.e-]+)', log_line)
-            if lr_match:
-                progress_info["learning_rate"] = float(lr_match.group(1))
-            
-            # Build detailed step description
-            step_desc = f"Step {current}/{total}"
-            if progress_info["loss"] is not None:
-                step_desc += f" (loss: {progress_info['loss']:.4f})"
-            
-            # Calculate ETA from time remaining in log: "[22:47<13:31, ...]"
-            time_match = re.search(r'<(\d+):(\d+)', log_line)
-            if time_match:
-                minutes = int(time_match.group(1))
-                seconds = int(time_match.group(2))
-                progress_info["estimated_minutes_remaining"] = minutes + (1 if seconds > 30 else 0)
-                step_desc += f" (~{progress_info['estimated_minutes_remaining']}min remaining)"
-            
-            progress_info["current_step"] = step_desc
-            return progress_info
-            
-    except Exception as ex:
-        logger.debug(f"Error parsing progress: {ex}")
-    
-    return progress_info
+        parsed.port
+    except ValueError as error:
+        raise ValueError(f"{label} is not a valid URL") from error
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{label} must be an absolute HTTPS URL without credentials")
+    return url
 
-def detect_sample_image(log_line: str, output_dir: Path) -> Optional[str]:
-    """Detects when AI Toolkit generates a sample image.
-    
-    Args:
-        log_line: Log line to check
-        output_dir: Output directory where samples are saved
-        
-    Returns:
-        Path to generated image if detected, None otherwise
-    """
-    # AI Toolkit saves samples to output/samples/ directory
-    if "Generating Images:" in log_line and "100%" in log_line:
-        # Sample generation completed - find the most recent image
-        samples_dir = output_dir / "samples"
-        if samples_dir.exists():
-            image_files = sorted(
-                samples_dir.glob("*.png"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-            if image_files:
-                return str(image_files[0].relative_to(NETWORK_VOLUME_PATH))
-    return None
 
-async def download_and_extract_dataset(dataset_url: str, local_path: Path) -> int:
-    """Downloads dataset ZIP and extracts images.
-    
-    Args:
-        dataset_url: Public URL to dataset ZIP file
-        local_path: Local directory to extract to
-        
-    Returns:
-        int: Number of images extracted
-    """
-    logger.info(f"Downloading dataset from: {dataset_url}")
-    local_path.mkdir(parents=True, exist_ok=True)
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(dataset_url, timeout=aiohttp.ClientTimeout(total=300)) as response:
-            if response.status != 200:
-                raise ValueError(f"Failed to download dataset: HTTP {response.status}")
-            
-            zip_data = await response.read()
-            logger.info(f"Downloaded ZIP: {len(zip_data) / 1024 / 1024:.1f}MB")
-    
-    # Extract ZIP
-    with zipfile.ZipFile(io.BytesIO(zip_data)) as zip_ref:
-        zip_ref.extractall(local_path)
-        logger.info(f"Extracted ZIP to {local_path}")
-    
-    # Count images
-    image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
-    image_files = [f for f in local_path.iterdir() if f.suffix.lower() in image_extensions]
-    
-    logger.info(f"Extracted {len(image_files)} images")
-    return len(image_files)
+def url_origin(url: str, label: str) -> str:
+    """Return the normalized HTTPS origin for an already validated URL."""
+    parsed = urllib.parse.urlsplit(require_https_url(url, label))
+    host = parsed.hostname.lower()
+    authority = f"[{host}]" if ":" in host else host
+    if parsed.port and parsed.port != 443:
+        authority = f"{authority}:{parsed.port}"
+    return f"https://{authority}"
 
-async def run_training(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Main training execution function with comprehensive progress tracking.
-    
-    Args:
-        event: RunPod event with training configuration
-        
-    Returns:
-        Dict with training results
-    """
-    input_data = event.get("input", {})
-    
-    # Validate inputs
-    required_fields = ["internal_job_id", "config", "dataset_urls"]
-    for field in required_fields:
-        if field not in input_data:
-            return {"success": False, "error": f"Missing required field: {field}"}
-    
-    job_id = str(input_data["internal_job_id"])
-    config_content = input_data["config"]
-    dataset_urls = input_data["dataset_urls"]
-    
-    if not isinstance(dataset_urls, list) or len(dataset_urls) == 0:
-        return {"success": False, "error": "At least one dataset URL is required"}
-    
-    try:
-        # Initialize RabbitMQ connection
-        await RabbitMQConnectionManager.initialize()
-        
-        model_name = extract_model_name_from_config(config_content)
-        session_id = f"session_{int(time.time())}"  # For logging/identification
-        start_time = time.time()
-        
-        # Setup paths on network volume using job_id for easy API retrieval
-        # Structure: /runpod-volume/jobs/{job_id}/
-        #   ├── dataset/           (training images)
-        #   ├── output/
-        #   │   ├── samples/       (preview images generated during training)
-        #   │   └── *.safetensors  (final model files)
-        #   └── config.yaml
-        # This allows simple API calls: GET /api/training/{job_id}/samples
-        job_dir = NETWORK_VOLUME_PATH / "jobs" / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        dataset_path = job_dir / "dataset"
-        output_dir = job_dir / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Starting training job {job_id} (session {session_id})")
-        logger.info(f"Model: {model_name}")
-        logger.info(f"Job directory: {job_dir}")
-        
-        # Publish training started event
-        await publish_event('training.started', job_id, {
-            'session_id': session_id,
-            'model_name': model_name,
-            'status': 'initializing',
-            'network_volume_path': f"jobs/{job_id}"
-        })
-        
-        # Download dataset
-        images_downloaded = await download_and_extract_dataset(dataset_urls[0], dataset_path)
-        
-        await publish_event('training.progress', job_id, {
-            'status': 'preparing',
-            'progress': 15,
-            'current_step': f"Prepared {images_downloaded} images for training",
-            'metadata': {
-                'images_downloaded': images_downloaded
-            }
-        })
-        
-        # Setup configuration
-        config_file = job_dir / "config.yaml"
-        config_data = yaml.safe_load(config_content)
-        
-        # Update paths in config
-        if 'config' in config_data and 'process' in config_data['config']:
-            for process in config_data['config']['process']:
-                if 'datasets' in process:
-                    for dataset in process['datasets']:
-                        dataset['folder_path'] = str(dataset_path)
-                if 'training_folder' in process:
-                    process['training_folder'] = str(output_dir)
-        
-        with open(config_file, 'w') as f:
-            yaml.dump(config_data, f, default_flow_style=False)
-        
-        # Start training
-        ai_toolkit_dir = Path("/app/ai-toolkit")
-        run_script = ai_toolkit_dir / "run.py"
-        
-        if not run_script.exists():
-            raise ValueError(f"AI Toolkit not found at {ai_toolkit_dir}")
-        
-        cmd = ["python", str(run_script), str(config_file)]
-        logger.info(f"Starting training: {' '.join(cmd)}")
-        
-        await publish_event('training.progress', job_id, {
-            'status': 'training',
-            'progress': 20,
-            'current_step': 'AI Toolkit training started'
-        })
-        
-        # Execute training with detailed progress monitoring
-        original_cwd = os.getcwd()
-        os.chdir(str(ai_toolkit_dir))
-        
-        last_progress_update = time.time()
-        progress_update_interval = 30  # Send update every 30 seconds
-        last_progress_info = None
-        sample_count = 0
-        
+
+def dataset_allowed_origins() -> set[str]:
+    """Load the exact object-storage origins permitted for dataset downloads."""
+    configured = os.getenv("AITK_DATASET_ALLOWED_ORIGINS", "")
+    if not configured.strip():
+        raise RuntimeError("AITK_DATASET_ALLOWED_ORIGINS must contain at least one HTTPS origin")
+    origins = set()
+    for value in configured.split(","):
+        candidate = value.strip()
+        parsed = urllib.parse.urlsplit(require_https_url(candidate, "Dataset allowlist origin"))
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("Dataset allowlist entries must be origins without paths, queries, or fragments")
+        origins.add(url_origin(candidate, "Dataset allowlist origin"))
+    return origins
+
+
+def open_dataset_response(url: str):
+    """Open an allowlisted dataset URL while validating every redirect target."""
+    allowed_origins = dataset_allowed_origins()
+    current_url = url
+    for redirect_count in range(MAX_DATASET_REDIRECTS + 1):
+        if url_origin(current_url, "Dataset archive URL") not in allowed_origins:
+            raise ValueError("Dataset archive URL origin is not allowlisted")
+        response = requests.get(current_url, stream=True, timeout=(20, 300), allow_redirects=False)
+        if response.status_code in REDIRECT_STATUSES:
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise ValueError("Dataset archive redirect is missing a location")
+            if redirect_count == MAX_DATASET_REDIRECTS:
+                raise ValueError("Dataset archive exceeded the redirect limit")
+            current_url = urllib.parse.urljoin(current_url, location)
+            continue
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-            
-            logger.info("Training process started")
-            
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                
-                if output:
-                    line = output.rstrip()
-                    print(line, flush=True)
-                    
-                    # Check for sample image generation
-                    sample_image_path = detect_sample_image(line, output_dir)
-                    if sample_image_path:
-                        sample_count += 1
-                        current_step = last_progress_info["current_step_number"] if last_progress_info else 0
-                        
-                        await publish_event('training.testimage', job_id, {
-                            'image_url': sample_image_path,
-                            'step_number': current_step,
-                            'caption': f"Training sample at step {current_step}",
-                            'metadata': {
-                                'sample_index': sample_count,
-                                'network_path': sample_image_path
-                            }
-                        })
-                        logger.info(f"Published test image event: {sample_image_path}")
-                    
-                    # Parse progress from each line
-                    current_time = time.time()
-                    progress_info = parse_progress_from_log(line, start_time)
-                    
-                    # Send update if interval elapsed and we have meaningful progress
-                    if current_time - last_progress_update >= progress_update_interval:
-                        if progress_info["progress"] > 0 or progress_info["loss"] is not None:
-                            # Calculate actual progress (20% base + 75% of training)
-                            actual_progress = min(95, 20 + int(progress_info["progress"] * 0.75))
-                            
-                            event_data = {
-                                'status': 'training',
-                                'progress': actual_progress,
-                                'current_step': progress_info["current_step"],
-                                'current_step_number': progress_info["current_step_number"],
-                                'total_steps': progress_info["total_steps"],
-                                'estimated_minutes_remaining': progress_info["estimated_minutes_remaining"],
-                                'loss': progress_info["loss"],
-                                'metadata': {
-                                    'learning_rate': progress_info["learning_rate"]
-                                }
-                            }
-                            
-                            await publish_event('training.progress', job_id, event_data)
-                            last_progress_update = current_time
-                            last_progress_info = progress_info
-            
-            # Get remaining output
-            remaining_output = process.stdout.read()
-            if remaining_output:
-                print(remaining_output, flush=True)
-            
-            return_code = process.poll()
-            
-            if return_code == 0:
-                logger.info("Training completed successfully")
-                
-                # List output files
-                output_files = list(output_dir.rglob('*'))
-                model_files = [str(f.relative_to(NETWORK_VOLUME_PATH)) 
-                             for f in output_files if f.is_file()]
-                
-                # Calculate total size
-                total_size_bytes = sum(f.stat().st_size for f in output_files if f.is_file())
-                
-                logger.info(f"Generated {len(model_files)} output files ({total_size_bytes / 1024 / 1024:.1f}MB)")
-                
-                # Publish completion event
-                await publish_event('training.completed', job_id, {
-                    'status': 'completed',
-                    'session_id': session_id,
-                    'model_name': model_name,
-                    'network_volume_path': f"jobs/{job_id}",
-                    'output_files': model_files,
-                    'images_processed': images_downloaded,
-                    'message': 'Training completed successfully',
-                    'metadata': {
-                        'total_size_bytes': total_size_bytes,
-                        'training_duration_minutes': int((time.time() - start_time) / 60),
-                        'final_loss': last_progress_info["loss"] if last_progress_info else None,
-                        'total_samples_generated': sample_count
-                    }
-                })
-                
-                return {
-                    "success": True,
-                    "message": "Training completed successfully",
-                    "session_id": session_id,
-                    "model_name": model_name,
-                    "job_id": job_id,
-                    "network_volume_path": f"jobs/{job_id}",
-                    "output_files": model_files,
-                    "total_size_mb": int(total_size_bytes / 1024 / 1024)
-                }
-            else:
-                logger.error(f"Training failed with return code: {return_code}")
-                
-                await publish_event('training.failed', job_id, {
-                    'status': 'failed',
-                    'error': f"Training process exited with code {return_code}",
-                    'message': 'Training failed',
-                    'metadata': {
-                        'session_id': session_id,
-                        'return_code': return_code
-                    }
-                })
-                
-                return {
-                    "success": False,
-                    "error": f"Training process failed with return code {return_code}",
-                    "session_id": session_id,
-                    "job_id": job_id
-                }
-        
-        finally:
-            os.chdir(original_cwd)
-    
-    except Exception as ex:
-        logger.error(f"Training error: {str(ex)}", exc_info=True)
-        
-        await publish_event('training.failed', job_id, {
-            'status': 'failed',
-            'error': str(ex),
-            'message': 'Training failed with exception',
-            'metadata': {
-                'error_type': type(ex).__name__
-            }
-        })
-        
-        return {
-            "success": False,
-            "error": str(ex),
-            "job_id": job_id
-        }
-    
-    finally:
-        # Cleanup RabbitMQ connection
-        await RabbitMQConnectionManager.cleanup()
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
+        return response
+    raise ValueError("Dataset archive exceeded the redirect limit")
 
-async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Async RunPod handler entry point."""
+
+def download_archive(url: str, destination: Path, max_bytes: int = MAX_ARCHIVE_BYTES) -> int:
+    """Download an allowlisted dataset archive with a compressed-size limit."""
+    with open_dataset_response(url) as response:
+        declared_size = int(response.headers.get("content-length", "0") or 0)
+        if declared_size > max_bytes:
+            raise ValueError("Dataset archive is too large")
+        downloaded = 0
+        with destination.open("wb") as archive:
+            for chunk in response.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise ValueError("Dataset archive is too large")
+                archive.write(chunk)
+    return downloaded
+
+
+def extract_archive(archive_path: Path, destination: Path, max_bytes: int = MAX_EXTRACTED_BYTES) -> int:
+    """Extract a ZIP while rejecting traversal, links, duplicates, and zip bombs."""
+    with zipfile.ZipFile(archive_path) as archive:
+        extracted_size = 0
+        for member in archive.infolist():
+            member_mode = member.external_attr >> 16
+            if stat.S_ISLNK(member_mode):
+                raise ValueError("Dataset archives cannot contain symbolic links")
+            extracted_size += member.file_size
+            if extracted_size > max_bytes:
+                raise ValueError("Extracted dataset is too large")
+            target = (destination / member.filename).resolve()
+            if target != destination and destination not in target.parents:
+                raise ValueError("Dataset archive contains an unsafe path")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise ValueError(f"Dataset archives contain duplicate path: {member.filename}")
+            with archive.open(member) as source, target.open("xb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+    return extracted_size
+
+
+def storage_client():
+    """Create an S3 client whose optional custom endpoint is HTTPS-only."""
+    required = ["AITK_S3_BUCKET", "AITK_S3_ACCESS_KEY", "AITK_S3_SECRET_KEY"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(f"Worker storage is missing: {', '.join(missing)}")
+    endpoint = os.getenv("AITK_S3_ENDPOINT", "").strip()
+    if endpoint:
+        endpoint = require_https_url(endpoint, "AITK_S3_ENDPOINT")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint or None,
+        region_name=os.getenv("AITK_S3_REGION", "us-east-1"),
+        aws_access_key_id=os.environ["AITK_S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["AITK_S3_SECRET_KEY"],
+    )
+
+
+def object_url(client, bucket: str, key: str) -> str:
+    """Return an HTTPS public or presigned URL for an uploaded object."""
+    public_base = os.getenv("AITK_S3_PUBLIC_BASE_URL", "").rstrip("/")
+    if public_base:
+        require_https_url(public_base, "AITK_S3_PUBLIC_BASE_URL")
+        return require_https_url(f"{public_base}/{urllib.parse.quote(key, safe='/')}", "Storage object URL")
+    generated = client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=min(int(os.getenv("AITK_URL_TTL_SECONDS", "604800")), 604800),
+    )
+    return require_https_url(generated, "Presigned storage object URL")
+
+
+def upload_file(client, session_id: str, path: Path, relative_name: str) -> dict[str, Any]:
+    """Upload one worker output and return its provider-neutral manifest entry."""
+    bucket = os.environ["AITK_S3_BUCKET"]
+    safe_name = "/".join(part for part in Path(relative_name).parts if part not in {"", ".", ".."})
+    key = f"training/{session_id}/{safe_name}"
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    client.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": content_type})
+    return {
+        "url": object_url(client, bucket, key),
+        "fileName": path.name,
+        "contentType": content_type,
+        "fileSize": path.stat().st_size,
+        "path": relative_name,
+    }
+
+
+def latest_loss(loss_db: Path) -> tuple[int | None, float | None]:
+    """Read the latest loss value from AI Toolkit's official UI logger database."""
+    if not loss_db.exists():
+        return None, None
     try:
-        logger.info("=== RunPod AI Training Handler Started ===")
-        logger.info(f"Backend ID: {BACKEND_ID}")
-        logger.info(f"Network volume: {NETWORK_VOLUME_PATH}")
-        logger.info(f"RabbitMQ configured: {bool(RABBITMQ_URL)}")
-        
-        result = await run_training(event)
-        
-        logger.info("=== RunPod AI Training Handler Completed ===")
-        return result
-        
-    except Exception as ex:
-        logger.error(f"Handler error: {str(ex)}", exc_info=True)
-        return {"success": False, "error": str(ex)}
+        connection = sqlite3.connect(f"file:{loss_db}?mode=ro", uri=True, timeout=2)
+        try:
+            key_row = connection.execute(
+                "SELECT key FROM metric_keys ORDER BY CASE WHEN key = 'loss' THEN 0 WHEN lower(key) LIKE '%loss%' THEN 1 ELSE 2 END, key LIMIT 1"
+            ).fetchone()
+            if not key_row:
+                return None, None
+            row = connection.execute(
+                "SELECT step, COALESCE(value_real, CAST(value_text AS REAL)) FROM metrics WHERE key = ? ORDER BY step DESC LIMIT 1",
+                (key_row[0],),
+            ).fetchone()
+            return (int(row[0]), float(row[1])) if row and row[1] is not None else (None, None)
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None, None
+
+
+def discover_samples(
+    client,
+    session_id: str,
+    sample_root: Path,
+    uploaded: dict[Path, dict[str, Any]],
+    minimum_age_seconds: float = 2,
+) -> list[dict[str, Any]]:
+    """Upload newly completed image, video, or audio training samples."""
+    if sample_root.exists():
+        for path in sorted(sample_root.iterdir()):
+            if not path.is_file() or path.is_symlink() or path.suffix.lower() not in SAMPLE_EXTENSIONS or path.name.startswith("."):
+                continue
+            if time.time() - path.stat().st_mtime < minimum_age_seconds:
+                continue
+            if path not in uploaded:
+                uploaded_file = upload_file(client, session_id, path, f"samples/{path.name}")
+                match = STEP_PATTERN.search(path.name)
+                uploaded[path] = {
+                    "url": uploaded_file["url"],
+                    "step": int(match.group(1)) if match else 0,
+                    "epoch": None,
+                    "caption": None,
+                    "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime)),
+                }
+    return list(uploaded.values())
+
+
+def drain_output(stream, tail: list[str]) -> None:
+    """Drain child-process output while retaining a bounded activity tail."""
+    for line in iter(stream.readline, ""):
+        clean = line.rstrip()
+        if clean:
+            tail.append(clean)
+            del tail[:-100]
+    stream.close()
+
+
+def artifact_kind(path: Path) -> str:
+    """Classify a generated file for Hartsy's artifact manifest."""
+    content_type = mimetypes.guess_type(path.name)[0] or ""
+    if path.suffix.lower() in {".yaml", ".yml", ".json"}:
+        return "config"
+    if content_type.startswith("image/"):
+        return "preview_image"
+    if content_type.startswith("video/"):
+        return "preview_video"
+    if content_type.startswith("audio/"):
+        return "audio"
+    return "weights"
+
+
+def upload_artifacts(client, session_id: str, output_dir: Path) -> list[dict[str, Any]]:
+    """Upload supported final artifacts and select the primary weights file."""
+    candidates = [
+        path
+        for path in output_dir.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and (path.resolve() == output_dir or output_dir in path.resolve().parents)
+        and ".tmp" not in path.parts
+        and ".thumbs" not in path.parts
+        and "samples" not in path.relative_to(output_dir).parts
+        and path.name != "loss_log.db"
+        and path.suffix.lower() in ARTIFACT_EXTENSIONS
+    ]
+    weight_files = [path for path in candidates if artifact_kind(path) == "weights"]
+    preferred = next((path for path in weight_files if path.suffix.lower() == ".safetensors" and "optimizer" not in path.name.lower()), None)
+    preferred = preferred or (weight_files[0] if weight_files else None)
+    artifacts = []
+    for path in sorted(candidates):
+        relative = path.relative_to(output_dir).as_posix()
+        uploaded = upload_file(client, session_id, path, f"artifacts/{relative}")
+        uploaded["kind"] = artifact_kind(path)
+        uploaded["isPrimary"] = path == preferred
+        artifacts.append(uploaded)
+    return artifacts
+
+
+def handler(job: dict[str, Any]) -> dict[str, Any]:
+    """Execute one versioned AI Toolkit training request for RunPod Serverless."""
+    payload = job.get("input") or {}
+    if payload.get("contract_version") != CONTRACT_VERSION:
+        raise ValueError(f"Unsupported contract_version; expected {CONTRACT_VERSION}")
+    session_id = require_identifier(payload, "session_id")
+    config_yaml = require_text(payload, "config_yaml")
+    if len(config_yaml.encode("utf-8")) > 2 * 1024 * 1024:
+        raise ValueError("AI Toolkit config is too large")
+    if payload.get("ai_toolkit_revision") != EXPECTED_REVISION:
+        raise ValueError("Hartsy and the AI Toolkit worker revisions do not match")
+
+    validate_installed_revision()
+    config = yaml.safe_load(config_yaml)
+    if not isinstance(config, dict) or not isinstance(config.get("config"), dict):
+        raise ValueError("config_yaml must contain a config object")
+    processes = config["config"].get("process")
+    if not isinstance(processes, list) or len(processes) != 1 or not isinstance(processes[0], dict):
+        raise ValueError("config_yaml must contain exactly one process object")
+    process = processes[0]
+    validate_process_paths(process)
+    total_steps = int(process.get("train", {}).get("steps", 0))
+    run_name = str(config["config"]["name"])
+    output_dir = (OUTPUT_ROOT / run_name).resolve()
+    if output_dir != OUTPUT_ROOT and OUTPUT_ROOT not in output_dir.parents:
+        raise ValueError("Unsafe AI Toolkit output path")
+
+    reset_directory(DATASET_ROOT)
+    reset_directory(OUTPUT_ROOT)
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    archives = payload.get("dataset_urls") or []
+    if not isinstance(archives, list) or not archives:
+        raise ValueError("input.dataset_urls must contain at least one archive")
+    if len(archives) > MAX_DATASET_ARCHIVES:
+        raise ValueError(f"input.dataset_urls cannot contain more than {MAX_DATASET_ARCHIVES} archives")
+    remaining_archive_bytes = MAX_ARCHIVE_BYTES
+    remaining_extracted_bytes = MAX_EXTRACTED_BYTES
+    for index, url in enumerate(archives):
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(f"input.dataset_urls[{index}] must be a non-empty URL")
+        archive_path = WORK_ROOT / f"dataset-{index}.zip"
+        try:
+            downloaded = download_archive(url.strip(), archive_path, remaining_archive_bytes)
+            remaining_archive_bytes -= downloaded
+            extracted = extract_archive(archive_path, DATASET_ROOT, remaining_extracted_bytes)
+            remaining_extracted_bytes -= extracted
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+    config_path = WORK_ROOT / f"{session_id}.yaml"
+    config_path.write_text(config_yaml, encoding="utf-8")
+    client = storage_client()
+    uploaded_samples: dict[Path, dict[str, Any]] = {}
+    output_tail: list[str] = []
+    started_at = time.monotonic()
+    command = [os.getenv("AI_TOOLKIT_PYTHON", "python"), str(TOOLKIT_ROOT / "run.py"), str(config_path)]
+    process_handle = subprocess.Popen(command, cwd=TOOLKIT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    assert process_handle.stdout is not None
+    reader = threading.Thread(target=drain_output, args=(process_handle.stdout, output_tail), daemon=True)
+    reader.start()
+    last_step = 0
+    last_loss = None
+    last_update = 0.0
+
+    try:
+        while process_handle.poll() is None:
+            now = time.monotonic()
+            step, loss = latest_loss(output_dir / "loss_log.db")
+            if step is not None:
+                last_step = step
+            if loss is not None:
+                last_loss = loss
+            samples = discover_samples(client, session_id, output_dir / "samples", uploaded_samples)
+            if now - last_update >= 5:
+                progress = min(99, max(1, round(last_step / total_steps * 100))) if total_steps > 0 else 1
+                elapsed = now - started_at
+                eta = round(elapsed / last_step * max(total_steps - last_step, 0)) if last_step > 0 and total_steps > 0 else None
+                runpod.serverless.progress_update(job, {
+                    "progress": progress,
+                    "message": f"AI Toolkit is training · step {last_step:,} of {total_steps:,}" if last_step else "AI Toolkit is loading the model and dataset",
+                    "step": last_step or None,
+                    "totalSteps": total_steps or None,
+                    "epoch": None,
+                    "totalEpochs": None,
+                    "loss": last_loss,
+                    "etaSeconds": eta,
+                    "samples": samples,
+                    "logsTail": output_tail[-20:],
+                })
+                last_update = now
+            time.sleep(2)
+
+        reader.join(timeout=5)
+        if process_handle.returncode != 0:
+            detail = output_tail[-1] if output_tail else "AI Toolkit exited without an error message"
+            raise RuntimeError(f"AI Toolkit failed with exit code {process_handle.returncode}: {detail}")
+
+        step, loss = latest_loss(output_dir / "loss_log.db")
+        if step is not None:
+            last_step = step
+        if loss is not None:
+            last_loss = loss
+        samples = discover_samples(client, session_id, output_dir / "samples", uploaded_samples, minimum_age_seconds=0)
+        artifacts = upload_artifacts(client, session_id, output_dir)
+        if not any(artifact["kind"] == "weights" for artifact in artifacts):
+            raise RuntimeError("AI Toolkit completed without producing a model artifact")
+        return {
+            "sessionId": session_id,
+            "aiToolkitRevision": EXPECTED_REVISION,
+            "finalLoss": last_loss,
+            "totalSteps": last_step or total_steps or None,
+            "artifacts": artifacts,
+            "samples": [sample["url"] for sample in samples],
+            "sampleDetails": samples,
+            "logsTail": output_tail[-20:],
+        }
+    except Exception as error:
+        runpod.serverless.progress_update(job, {
+            "progress": min(99, max(0, round(last_step / total_steps * 100))) if total_steps else 0,
+            "message": "AI Toolkit training failed",
+            "step": last_step or None,
+            "totalSteps": total_steps or None,
+            "loss": last_loss,
+            "error": str(error),
+            "samples": list(uploaded_samples.values()),
+        })
+        raise
+    finally:
+        if process_handle.poll() is None:
+            process_handle.terminate()
+            try:
+                process_handle.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process_handle.kill()
+                process_handle.wait()
+        reader.join(timeout=5)
+
 
 if __name__ == "__main__":
-    logger.info(f"Starting RunPod Serverless AI-Toolkit Handler v3.2")
-    logger.info(f"Backend ID: {BACKEND_ID}")
-    logger.info("Using aio-pika for async RabbitMQ messaging")
     runpod.serverless.start({"handler": handler})
