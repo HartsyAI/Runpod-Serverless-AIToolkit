@@ -1,0 +1,4 @@
+boto3==1.43.83
+PyYAML==6.0.3
+requests==2.34.2
+runpod==1.12.0
