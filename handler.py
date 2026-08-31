@@ -27,6 +27,7 @@ CONTRACT_VERSION = 2
 EXPECTED_REVISION = "be995185f598c83abb990a088e9f634c4d36eb46"
 TOOLKIT_ROOT = Path(os.getenv("AI_TOOLKIT_ROOT", "/app/ai-toolkit")).resolve()
 WORK_ROOT = Path(os.getenv("AITK_WORK_ROOT", "/workspace")).resolve()
+VOLUME_ROOT = Path(os.getenv("AITK_VOLUME_ROOT", "/runpod-volume")).resolve()
 DATASET_ROOT = Path("/dataset").resolve()
 OUTPUT_ROOT = (WORK_ROOT / "output").resolve()
 MAX_ARCHIVE_BYTES = max(1, int(os.getenv("AITK_MAX_ARCHIVE_BYTES", str(4 * 1024**3))))
@@ -239,12 +240,21 @@ def object_url(client, bucket: str, key: str) -> str:
 
 
 def upload_file(client, session_id: str, path: Path, relative_name: str) -> dict[str, Any]:
-    """Upload one worker output and return its provider-neutral manifest entry."""
+    """Publish one worker output onto the attached network volume and return its provider-neutral manifest entry.
+
+    The endpoint's network volume is already mounted at VOLUME_ROOT, and its object keys are the same paths as
+    RunPod's S3-compatible API uses for that bucket — so publishing is a local copy, not a network upload. `client`
+    is kept only to sign the returned URL via object_url().
+    """
     bucket = os.environ["AITK_S3_BUCKET"]
     safe_name = "/".join(part for part in Path(relative_name).parts if part not in {"", ".", ".."})
     key = f"training/{session_id}/{safe_name}"
+    if not VOLUME_ROOT.is_mount():
+        raise RuntimeError(f"{VOLUME_ROOT} is not a mounted network volume; cannot publish worker output")
+    destination = (VOLUME_ROOT / key).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, destination)
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    client.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": content_type})
     return {
         "url": object_url(client, bucket, key),
         "fileName": path.name,

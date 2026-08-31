@@ -28,21 +28,21 @@ The first successful push creates `kalebbroo/runpod-serverless-aitoolkit` if it 
 
 The workflow publishes BuildKit provenance and an SBOM with release images and uses the GitHub Actions cache for subsequent builds.
 
-Create a queue-based RunPod Serverless endpoint from that immutable image. Use one concurrent request per worker because `/dataset` and `/workspace/output` are intentionally reset for every request. Allocate enough container disk for the model cache plus dataset/output and choose a GPU configuration appropriate for the largest model families you enable. Hartsy sends a 24-hour execution policy and seven-day status TTL by default; the endpoint must permit those limits.
+Create a queue-based RunPod Serverless endpoint from that immutable image with a network volume attached — outputs publish onto it at `AITK_VOLUME_ROOT` (default `/runpod-volume`, RunPod's default Serverless mount point). Use one concurrent request per worker because `/dataset` and `/workspace/output` are intentionally reset for every request. Allocate enough container disk for the model cache plus dataset/output and choose a GPU configuration appropriate for the largest model families you enable. Hartsy sends a 24-hour execution policy and seven-day status TTL by default; the endpoint must permit those limits.
 
 Required worker environment:
 
-- `AITK_S3_BUCKET`, `AITK_S3_ACCESS_KEY`, `AITK_S3_SECRET_KEY`
+- `AITK_S3_BUCKET`, `AITK_S3_ACCESS_KEY`, `AITK_S3_SECRET_KEY` — the attached network volume's ID and an S3 API key with access to it. The worker publishes outputs with a local copy onto the volume mount, not a network upload; these credentials only sign the returned object URL.
 - `AITK_S3_ENDPOINT` for S3-compatible storage, when not using AWS
 - `AITK_S3_REGION` (default `us-east-1`)
 - `AITK_S3_PUBLIC_BASE_URL` for public objects, or omit it to return seven-day signed URLs
 - `AITK_DATASET_ALLOWED_ORIGINS`, a comma-separated list of exact HTTPS origins Hartsy may use for prepared archives, for example `https://storage.hartsy.ai,https://example.r2.cloudflarestorage.com`
 
-Optional limits: `AITK_MAX_ARCHIVE_BYTES`, `AITK_MAX_EXTRACTED_BYTES`, `AITK_MAX_DATASET_ARCHIVES`, `AITK_URL_TTL_SECONDS`, `AITK_WORK_ROOT`, and `AI_TOOLKIT_PYTHON`.
+Optional limits: `AITK_MAX_ARCHIVE_BYTES`, `AITK_MAX_EXTRACTED_BYTES`, `AITK_MAX_DATASET_ARCHIVES`, `AITK_URL_TTL_SECONDS`, `AITK_WORK_ROOT`, `AITK_VOLUME_ROOT`, and `AI_TOOLKIT_PYTHON`.
 
 Hartsy needs `RUNPOD_API_KEY` and `RUNPOD_AI_TOOLKIT_ENDPOINT_ID`. It can override `AI_TOOLKIT_EXECUTION_TIMEOUT_MS` and `AI_TOOLKIT_JOB_TTL_MS` within RunPod's seven-day maximum.
 
-The worker validates its installed AI Toolkit revision and all worker-owned paths, safely downloads and extracts Hartsy's prepared dataset, launches unmodified `run.py`, reads the official `loss_log.db`, uploads new samples as they appear, emits structured RunPod progress updates, and returns an artifact manifest for durable Hartsy ingestion.
+The worker validates its installed AI Toolkit revision and all worker-owned paths, safely downloads and extracts Hartsy's prepared dataset, launches unmodified `run.py`, reads the official `loss_log.db`, publishes new samples onto the network volume as they appear, emits structured RunPod progress updates, and returns an artifact manifest for durable Hartsy ingestion.
 
 ## Versioned request contract
 

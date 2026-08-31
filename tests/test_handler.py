@@ -151,6 +151,35 @@ class HandlerContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be an absolute HTTPS URL"):
                 handler.object_url(presigner, "bucket", "artifact.safetensors")
 
+    def test_upload_file_copies_onto_the_mounted_network_volume_instead_of_uploading(self):
+        """Publishing a worker output is a local copy onto the attached volume, not a network upload."""
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "model.safetensors"
+            source.write_bytes(b"weights")
+            volume_root = Path(temporary) / "volume"
+            volume_root.mkdir()
+            client = mock.Mock()
+            with mock.patch.object(handler, "VOLUME_ROOT", volume_root), \
+                    mock.patch.object(Path, "is_mount", return_value=True), \
+                    mock.patch.dict(os.environ, {"AITK_S3_BUCKET": "bucket"}, clear=True), \
+                    mock.patch.object(handler, "object_url", return_value="https://storage.example/signed") as object_url:
+                manifest = handler.upload_file(client, "session", source, "artifacts/model.safetensors")
+            client.upload_file.assert_not_called()
+            object_url.assert_called_once_with(client, "bucket", "training/session/artifacts/model.safetensors")
+            self.assertEqual(b"weights", (volume_root / "training/session/artifacts/model.safetensors").read_bytes())
+            self.assertEqual("https://storage.example/signed", manifest["url"])
+            self.assertEqual("artifacts/model.safetensors", manifest["path"])
+
+    def test_upload_file_requires_a_real_network_volume_mount(self):
+        """A worker without an attached volume fails loudly instead of silently losing output."""
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "model.safetensors"
+            source.write_bytes(b"weights")
+            with mock.patch.object(handler, "VOLUME_ROOT", Path(temporary) / "not-mounted"), \
+                    mock.patch.dict(os.environ, {"AITK_S3_BUCKET": "bucket"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "not a mounted network volume"):
+                    handler.upload_file(mock.Mock(), "session", source, "artifacts/model.safetensors")
+
 
 if __name__ == "__main__":
     unittest.main()
